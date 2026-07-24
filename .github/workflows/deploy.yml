@@ -1,0 +1,92 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # manual "Run workflow" button + `gh workflow run deploy.yml`
+
+# Never run two deploys at once; queue instead of cancelling a running one.
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  DEPLOY_PATH: /var/www/openreply.ivanovic.dev
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `npm run build` runs `prisma generate` first, so the generated client
+      # exists before we bundle the worker. Build-time env values are throwaway
+      # PLACEHOLDERS — real secrets live in .env on the VPS and are injected at
+      # runtime. There are no NEXT_PUBLIC_* vars, so none of these are inlined.
+      - name: Build web app (standalone)
+        run: npm run build
+        env:
+          DATABASE_URL: postgresql://build:build@localhost:5432/build
+          REDIS_URL: redis://localhost:6379
+          NEXTAUTH_URL: https://openreply.ivanovic.dev
+          NEXTAUTH_SECRET: build-time-placeholder-secret
+          CRON_SECRET: build-time-placeholder-secret
+          ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          RESEND_API_KEY: re_build
+          EMAIL_FROM: "OpenReply <login@example.com>"
+          META_GRAPH_API_VERSION: v25.0
+          INSTAGRAM_APP_ID: build
+          INSTAGRAM_APP_SECRET: build
+          FACEBOOK_APP_SECRET: build
+          WEBHOOK_VERIFY_TOKEN: build
+
+      - name: Build worker bundle
+        run: npm run build:worker
+
+      - name: Assemble deployment bundle
+        run: |
+          mkdir -p bundle
+          # Standalone server + the node_modules Next traced (the worker shares
+          # these at runtime — @prisma/client, bullmq, ioredis, pg, adapter-pg).
+          cp -r .next/standalone/. bundle/
+          # Static assets + public files are NOT in the standalone output.
+          mkdir -p bundle/.next
+          cp -r .next/static bundle/.next/static
+          cp -r public bundle/public
+          # Prisma schema + migrations so the server can run `migrate deploy`.
+          cp -r prisma bundle/prisma
+          # The bundled ESM worker, PM2 config, and the maintenance-cron script.
+          cp dist/worker.mjs bundle/worker.mjs
+          cp deploy/ecosystem.config.js bundle/
+          cp deploy/cron.sh bundle/
+
+      - name: Set up SSH
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          SSH_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "${{ secrets.VPS_PORT || 22 }}" "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Sync bundle to server
+        run: |
+          rsync -az --delete \
+            --exclude '.env' \
+            -e "ssh -i ~/.ssh/deploy_key -p ${{ secrets.VPS_PORT || 22 }}" \
+            bundle/ "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:$DEPLOY_PATH/"
+
+      - name: Migrate database and reload apps
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "${{ secrets.VPS_PORT || 22 }}" \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+            DEPLOY_PATH="$DEPLOY_PATH" bash -s < deploy/remote-deploy.sh

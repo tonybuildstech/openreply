@@ -19,6 +19,8 @@
 
 # production
 /build
+/dist
+/bundle
 
 # misc
 .DS_Store
@@ -36,6 +38,9 @@ yarn-error.log*
 
 # vercel
 .vercel
+
+# local-only development workspace (private notes, plans, research prompts)
+/.dev/
 
 # typescript
 *.tsbuildinfo

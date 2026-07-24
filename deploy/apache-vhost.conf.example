@@ -1,0 +1,32 @@
+# Apache reverse-proxy vhost for OpenReply.
+# Copy to /etc/apache2/sites-available/openreply.ivanovic.dev.conf and adapt.
+#
+# One-time module enable:  sudo a2enmod proxy proxy_http headers
+# Enable the site:         sudo a2ensite openreply.ivanovic.dev && sudo apachectl configtest && sudo systemctl reload apache2
+# Add HTTPS (Let's Encrypt):
+#   sudo certbot --apache -d openreply.ivanovic.dev
+#   In the :443 vhost certbot generates, change X-Forwarded-Proto to "https".
+
+<VirtualHost *:80>
+    ServerName openreply.ivanovic.dev
+
+    # Immutable Next build assets — serve straight from disk, bypass Node.
+    Alias /_next/static/ /var/www/openreply.ivanovic.dev/.next/static/
+    <Directory /var/www/openreply.ivanovic.dev/.next/static/>
+        Require all granted
+        Header set Cache-Control "public, max-age=31536000, immutable"
+    </Directory>
+
+    # Everything else → the Next standalone server on loopback.
+    ProxyPreserveHost On
+    ProxyPass /_next/static/ !
+    ProxyPass / http://127.0.0.1:3001/
+    ProxyPassReverse / http://127.0.0.1:3001/
+
+    # The app is behind a proxy; tell it the original scheme.
+    # In the :443 (SSL) vhost this MUST be "https".
+    RequestHeader set X-Forwarded-Proto "http"
+
+    ErrorLog ${APACHE_LOG_DIR}/openreply_error.log
+    CustomLog ${APACHE_LOG_DIR}/openreply_access.log combined
+</VirtualHost>
