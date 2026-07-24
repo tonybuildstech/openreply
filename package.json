@@ -20,6 +20,7 @@
     "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "^7.8.0",
     "@vercel/analytics": "^2.0.1",
+    "bcryptjs": "^3.0.2",
     "bullmq": "^5.76.4",
     "ioredis": "^5.10.1",
     "next": "^16.2.6",
