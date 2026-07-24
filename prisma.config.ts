@@ -26,6 +26,11 @@ export default {
     path: "prisma/migrations",
   },
   datasource: {
-    url: process.env["DATABASE_URL"],
+    // Migrations need a real session (advisory locks, etc.). Supabase's
+    // transaction pooler (port 6543) can't hold one, so `migrate deploy` hangs
+    // against it. Point Prisma at a direct/session connection when provided
+    // (DIRECT_URL = Supabase "Session pooler", port 5432), and fall back to
+    // DATABASE_URL for local/direct setups where the URL is already direct.
+    url: process.env["DIRECT_URL"] ?? process.env["DATABASE_URL"],
   },
 };

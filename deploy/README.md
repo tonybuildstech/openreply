@@ -37,12 +37,16 @@ Supabase ◀── web + worker connect over SSL
    root — keep it dedicated and rotate if exposed. Ensure `sshd_config` has
    `PermitRootLogin prohibit-password` (the Debian default — allows key auth,
    blocks password login).
-3. **VPS provisioning (as root):** Node 20 (`node -v`), `npm i -g pm2` then
+3. **VPS provisioning (as root):** Node 22 LTS (`node -v` ⇒ v22.x — Prisma 7
+   needs ≥20.19), `npm i -g pm2` then
    `pm2 startup`, Apache with `a2enmod proxy proxy_http headers`,
    `mkdir -p /var/www/openreply.ivanovic.dev` (root owns it), and Redis
    (`apt install redis-server`).
 4. **Server `.env`** at `/var/www/openreply.ivanovic.dev/.env` with every var from
-   `../.env.example` — real secrets, `DATABASE_URL` = Supabase,
+   `../.env.example` — real secrets, `DATABASE_URL` = Supabase **transaction
+   pooler** (port 6543, for the app runtime), `DIRECT_URL` = Supabase **session
+   pooler** (port 5432, used only by `prisma migrate deploy` — the transaction
+   pooler hangs on the migration advisory lock),
    `REDIS_URL=redis://127.0.0.1:6379`, `NEXTAUTH_URL=https://openreply.ivanovic.dev`.
    This file is **never** rsynced (excluded), so it survives every deploy.
 5. **HTTPS:** `certbot --apache -d openreply.ivanovic.dev`; set

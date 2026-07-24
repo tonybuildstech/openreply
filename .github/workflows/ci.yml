@@ -18,7 +18,8 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # Keep in lockstep with deploy.yml and the VPS (Node 22 LTS).
+          node-version: "22"
           cache: npm
 
       - name: Install dependencies

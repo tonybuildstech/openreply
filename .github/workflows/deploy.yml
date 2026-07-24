@@ -21,7 +21,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # Match the VPS runtime. Prisma 7 needs >=20.19; we run Node 22 LTS
+          # everywhere (runner build + VPS) so build and runtime stay coherent.
+          node-version: "22"
           cache: npm
 
       - name: Install dependencies
