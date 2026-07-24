@@ -63,6 +63,9 @@ jobs:
           cp -r public bundle/public
           # Prisma schema + migrations so the server can run `migrate deploy`.
           cp -r prisma bundle/prisma
+          # Prisma 7 reads the datasource URL from the config file (the schema
+          # can no longer hold `url`), so the config must ship alongside it.
+          cp prisma.config.ts bundle/
           # The bundled ESM worker, PM2 config, and the maintenance-cron script.
           cp dist/worker.mjs bundle/worker.mjs
           cp deploy/ecosystem.config.js bundle/
