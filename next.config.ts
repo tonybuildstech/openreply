@@ -12,7 +12,18 @@ const nextConfig: NextConfig = {
   // shipped node_modules at runtime. Without this, Next bundles bullmq into the
   // web app's server chunks and never emits node_modules/bullmq, so the worker
   // crashes on boot with ERR_MODULE_NOT_FOUND. See scripts/build-worker.mjs.
-  serverExternalPackages: ["bullmq", "ioredis", "pg", "@prisma/client"],
+  // This list must cover EVERY bare package in the worker's import graph
+  // (worker/dm-worker.ts → lib/queue/dm-worker, lib/polling/comment-reconciler,
+  // lib/ops/worker-health). Miss one and the worker crash-loops on boot.
+  // zod arrives via lib/meta/oauth → lib/env; @prisma/adapter-pg via lib/db/client.
+  serverExternalPackages: [
+    "bullmq",
+    "ioredis",
+    "pg",
+    "@prisma/client",
+    "@prisma/adapter-pg",
+    "zod",
+  ],
   reactCompiler: true,
   turbopack: {
     root: process.cwd(),
