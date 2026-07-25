@@ -17,7 +17,7 @@ module.exports = {
       max_memory_restart: "400M",
       env: {
         NODE_ENV: "production",
-        PORT: 3001, // Apache reverse-proxies here; bound to loopback only
+        PORT: 3003, // Apache reverse-proxies here; bound to loopback only
         HOSTNAME: "127.0.0.1",
       },
     },
