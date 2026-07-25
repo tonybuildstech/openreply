@@ -6,6 +6,13 @@ const nextConfig: NextConfig = {
   // node_modules) so the VPS runs the build artifact without the source tree
   // or dev dependencies. See deploy/ and .github/workflows/deploy.yml.
   output: "standalone",
+  // Keep the worker's runtime deps UNBUNDLED so Next traces them (with their
+  // transitive deps) into .next/standalone/node_modules. The DM worker
+  // (dist/worker.mjs, esbuild `packages: "external"`) resolves these from that
+  // shipped node_modules at runtime. Without this, Next bundles bullmq into the
+  // web app's server chunks and never emits node_modules/bullmq, so the worker
+  // crashes on boot with ERR_MODULE_NOT_FOUND. See scripts/build-worker.mjs.
+  serverExternalPackages: ["bullmq", "ioredis", "pg", "@prisma/client"],
   reactCompiler: true,
   turbopack: {
     root: process.cwd(),
