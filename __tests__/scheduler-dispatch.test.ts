@@ -5,6 +5,8 @@ import {
   getAdapter,
   getDispatchMode,
 } from "../lib/scheduler/adapters";
+import { toUserTagsParam } from "../lib/scheduler/adapters/instagram";
+import { toTagList } from "../lib/scheduler/adapters/youtube";
 import { MEDIA_TYPE_BY_PLATFORM, PublishError } from "../lib/scheduler/types";
 
 /**
@@ -67,6 +69,45 @@ describe("media types per platform", () => {
     const all = Object.values(MEDIA_TYPE_BY_PLATFORM).flat();
 
     expect(new Set(all).size).toBe(all.length);
+  });
+});
+
+/**
+ * The composer collects friendly comma-separated lists; both platforms want
+ * something else. These conversions fail silently if wrong — the post publishes
+ * without the tags rather than erroring — so they are worth pinning.
+ */
+describe("composer option conversions", () => {
+  it("turns an Instagram username list into Meta's user_tags JSON", () => {
+    expect(toUserTagsParam("maya.co, alex")).toBe(
+      '[{"username":"maya.co"},{"username":"alex"}]'
+    );
+  });
+
+  it("strips a leading @ and ignores blank entries", () => {
+    expect(toUserTagsParam("@maya, , @alex,")).toBe(
+      '[{"username":"maya"},{"username":"alex"}]'
+    );
+  });
+
+  it("returns null for an empty list so the param is omitted entirely", () => {
+    // Sending user_tags=[] is not the same as not sending it.
+    expect(toUserTagsParam("")).toBeNull();
+    expect(toUserTagsParam("  ,  ")).toBeNull();
+  });
+
+  it("splits YouTube tags into an array and trims them", () => {
+    expect(toTagList("studio, behind the scenes ,vlog")).toEqual([
+      "studio",
+      "behind the scenes",
+      "vlog",
+    ]);
+  });
+
+  it("yields an empty array for absent YouTube tags", () => {
+    expect(toTagList(undefined)).toEqual([]);
+    expect(toTagList("")).toEqual([]);
+    expect(toTagList(" , ")).toEqual([]);
   });
 });
 

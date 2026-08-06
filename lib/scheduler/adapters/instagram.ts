@@ -53,6 +53,23 @@ interface InstagramOptions {
   thumbOffset?: number;
   audioName?: string;
   collaborators?: string;
+  locationId?: string;
+  /** Comma-separated usernames from the composer. */
+  userTags?: string;
+}
+
+/**
+ * Meta wants `user_tags` as a JSON array of objects, not a username list.
+ * The composer collects the friendlier comma-separated form.
+ */
+export function toUserTagsParam(usernames: string): string | null {
+  const tags = usernames
+    .split(",")
+    .map((name) => name.trim().replace(/^@/, ""))
+    .filter(Boolean)
+    .map((username) => ({ username }));
+
+  return tags.length > 0 ? JSON.stringify(tags) : null;
 }
 
 interface MetaErrorBody {
@@ -157,6 +174,11 @@ async function createContainer(
   if (options.audioName) params.set("audio_name", options.audioName);
   if (options.collaborators) {
     params.set("collaborators", options.collaborators);
+  }
+  if (options.locationId) params.set("location_id", options.locationId);
+  if (options.userTags) {
+    const userTags = toUserTagsParam(options.userTags);
+    if (userTags) params.set("user_tags", userTags);
   }
 
   const body = await metaRequest(

@@ -2,13 +2,33 @@ import type { Metadata } from "next";
 import type { ReactNode } from "react";
 import Link from "next/link";
 
+/* Keep the name at the front of the title and identical to the OAuth consent
+   screen name — see the note in app/layout.tsx. */
 export const metadata: Metadata = {
-  title: "OpenReply - Open source Instagram comment-to-DM automation",
+  title: "OpenReply - Instagram comment-to-DM automation and video scheduling",
   description:
-    "A free, self-hosted ManyChat alternative. Turn Instagram keyword comments into automatic private replies using the official Meta API.",
+    "OpenReply is a free, self-hosted social media tool. It sends an automatic Instagram DM when someone comments your keyword on a post or reel, and schedules your videos to Instagram, TikTok, YouTube and Facebook Pages using the official APIs.",
 };
 
 const GITHUB_URL = "https://github.com/diwenne/openreply";
+
+/** The exact string configured as the app name on every OAuth consent screen. */
+const APP_NAME = "OpenReply";
+
+/* Machine-readable restatement of the app name and purpose. OAuth reviewers
+   (and their tooling) read this to confirm the home page describes the same
+   product as the consent screen. `name` must stay byte-identical to APP_NAME. */
+const appJsonLd = {
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  name: APP_NAME,
+  applicationCategory: "BusinessApplication",
+  operatingSystem: "Web",
+  description:
+    "OpenReply is a free, open-source social media management application for businesses and creators. It automatically sends an Instagram direct message when someone comments a chosen keyword on one of your own posts or reels, and it schedules video content to Instagram, TikTok, YouTube and Facebook Pages. It uses only the official Meta, Google and TikTok APIs.",
+  offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+  isAccessibleForFree: true,
+};
 
 function formatStars(count: number): string {
   if (count >= 1000) {
@@ -239,10 +259,17 @@ function DashboardPreview() {
   );
 }
 
+/**
+ * Decorative only — the star count must never gate the home page. This page is
+ * the surface Google and Meta review for OAuth verification, so a slow or
+ * rate-limited api.github.com (unauthenticated calls are 60/hour per IP, and
+ * the VPS shares one) must degrade to "no badge" rather than stall the render.
+ */
 async function getGitHubStars(): Promise<number | null> {
   try {
     const res = await fetch("https://api.github.com/repos/diwenne/openreply", {
       headers: { Accept: "application/vnd.github+json" },
+      signal: AbortSignal.timeout(3000),
       next: { revalidate: 3600 },
     });
     if (!res.ok) return null;
@@ -257,10 +284,16 @@ export default async function Home() {
   const stars = await getGitHubStars();
   return (
     <main className="min-h-screen bg-background text-foreground">
+      <script
+        type="application/ld+json"
+        // Static object literal defined above; no user input reaches it.
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(appJsonLd) }}
+      />
+
       <header className="sticky top-0 z-40 border-b border-border bg-background">
         <div className="mx-auto flex h-16 w-full max-w-6xl items-center justify-between px-5 sm:px-6 lg:px-8">
-          <Link href="/" className="flex items-center gap-3" aria-label="OpenReply home">
-            <span className="text-lg font-bold text-white">OpenReply</span>
+          <Link href="/" className="flex items-center gap-3" aria-label={`${APP_NAME} home`}>
+            <span className="text-lg font-bold text-white">{APP_NAME}</span>
           </Link>
 
           <div className="flex items-center gap-4">
@@ -292,21 +325,29 @@ export default async function Home() {
             Open source · Official Meta, Google and TikTok APIs
           </div>
 
-          {/* The product name leads the H1 on purpose: Google's OAuth
-              verification checks that the name on this page matches the name on
-              the consent screen, and a headline without it reads as a mismatch. */}
-          <h1 className="mt-7 text-balance text-5xl font-black leading-[1.02] text-white sm:text-6xl lg:text-7xl">
-            OpenReply makes every comment start the right DM
+          {/* The H1 is the app name followed by what the app does, in that
+              order. Google's OAuth verification rejects a home page whose name
+              differs from the consent screen name, and rejects one that does
+              not state the app's purpose — this line has to satisfy both on
+              its own, without the reader scrolling. Keep the leading word
+              identical to APP_NAME; do not replace it with a slogan. */}
+          <h1 className="mt-7 text-balance text-4xl font-black leading-[1.05] text-white sm:text-5xl lg:text-6xl">
+            {APP_NAME}
+            <span className="mt-3 block text-2xl font-bold leading-snug text-zinc-200 sm:text-3xl lg:text-4xl">
+              Instagram comment-to-DM automation and video scheduling
+            </span>
           </h1>
 
           <p className="mt-6 max-w-2xl text-lg leading-8 text-zinc-300">
-            <strong className="font-semibold text-white">OpenReply</strong> is a
-            free, self-hosted social media tool for businesses and creators. It
-            does two things: it sends an automatic Instagram DM when someone
-            comments your keyword on a post or reel, and it schedules your video
-            content to Instagram, TikTok, YouTube and Facebook Pages. Everything
-            runs on the platforms&apos; own official APIs — no scraping, no
-            browser automation, and no password sharing.
+            <strong className="font-semibold text-white">{APP_NAME}</strong> is a
+            free, open-source, self-hosted social media management application
+            for businesses and creators. It does two things. First, it sends an
+            automatic Instagram direct message to anyone who comments a keyword
+            you chose on one of your own posts or reels. Second, it schedules
+            your video content and publishes it to Instagram, TikTok, YouTube
+            and Facebook Pages at the time you pick. Everything runs on the
+            platforms&apos; own official APIs — no scraping, no browser
+            automation, and no password sharing.
           </p>
 
           <div className="mt-8 flex flex-col gap-3 sm:flex-row">
@@ -555,7 +596,7 @@ export default async function Home() {
 
       <footer className="border-t border-white/10 py-8">
         <div className="mx-auto flex w-full max-w-7xl flex-col gap-4 px-5 text-sm text-zinc-500 sm:px-6 md:flex-row md:items-center md:justify-between lg:px-8">
-          <span className="font-semibold text-zinc-300">OpenReply</span>
+          <span className="font-semibold text-zinc-300">{APP_NAME}</span>
 
           {/* OAuth verification (Google and Meta both) requires the privacy
               policy to be reachable from the home page, not just from a

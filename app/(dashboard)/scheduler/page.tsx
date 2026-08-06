@@ -1,16 +1,17 @@
 "use client";
 
 /**
- * Scheduled posts — grouped by day, with per-item retry and cancel.
+ * Scheduled posts — grouped by day, one card per post.
  *
  * Status wording is deliberately literal. "Scheduled" means the platform is
  * holding it (YouTube, Facebook); "Queued" means OpenReply's worker will
  * publish it (Instagram, TikTok) and therefore depends on the worker running.
- * Those are genuinely different promises and the list does not blur them.
+ * Those are different promises and the list does not blur them.
  */
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { AccountAvatar } from "@/components/scheduler/platform-logo";
 import {
   PLATFORM_META,
   POST_STATUS_LABELS,
@@ -32,6 +33,7 @@ interface ScheduledPost {
     id: string;
     platform: PlatformKey;
     displayName: string;
+    avatarUrl: string | null;
     status: string;
   };
 }
@@ -43,6 +45,16 @@ const FILTERS = [
   "PUBLISHED",
   "FAILED",
 ] as const;
+
+const STATUS_DOT: Record<string, string> = {
+  QUEUED: "bg-warning",
+  UPLOADING: "bg-warning",
+  PUBLISHING: "bg-warning",
+  SCHEDULED_REMOTE: "bg-muted",
+  PUBLISHED: "bg-success",
+  FAILED: "bg-error",
+  CANCELED: "bg-border",
+};
 
 function dayKey(iso: string): string {
   return new Date(iso).toLocaleDateString(undefined, {
@@ -76,10 +88,7 @@ export default function SchedulerPage() {
   }, [load]);
 
   async function act(post: ScheduledPost, action: "retry" | "cancel") {
-    if (
-      action === "cancel" &&
-      !confirm("Cancel this scheduled post?")
-    ) {
+    if (action === "cancel" && !confirm("Cancel this scheduled post?")) {
       return;
     }
 
@@ -110,8 +119,8 @@ export default function SchedulerPage() {
   }, {});
 
   return (
-    <div className="space-y-6">
-      <header className="flex items-start justify-between gap-4">
+    <div className="space-y-5">
+      <header className="flex flex-wrap items-start justify-between gap-4">
         <div className="space-y-1">
           <h1 className="text-xl font-semibold">Scheduled posts</h1>
           <p className="text-sm text-muted">
@@ -121,13 +130,13 @@ export default function SchedulerPage() {
         <div className="flex shrink-0 gap-2">
           <Link
             href="/scheduler/connections"
-            className="rounded border border-border px-3 py-1.5 text-sm hover:bg-surface"
+            className="rounded-lg border border-border px-3 py-2 text-sm transition hover:bg-surface"
           >
             Connections
           </Link>
           <Link
             href="/scheduler/compose"
-            className="rounded border border-border px-3 py-1.5 text-sm font-medium hover:bg-surface"
+            className="rounded-lg border border-border bg-surface px-3 py-2 text-sm font-medium transition hover:bg-background"
           >
             New post
           </Link>
@@ -139,36 +148,42 @@ export default function SchedulerPage() {
           <button
             key={option}
             onClick={() => setFilter(option)}
-            className={`rounded border px-3 py-1 text-sm ${
+            className={`rounded-full border px-3.5 py-1.5 text-sm transition ${
               filter === option
-                ? "border-border bg-surface font-medium"
-                : "border-transparent text-muted hover:bg-surface"
+                ? "border-foreground/25 bg-surface font-medium"
+                : "border-border text-muted hover:text-foreground"
             }`}
           >
             {option === "ALL"
               ? "All"
-              : POST_STATUS_LABELS[option]?.label ?? option}
+              : (POST_STATUS_LABELS[option]?.label ?? option)}
           </button>
         ))}
       </div>
 
-      {actionError && <p className="text-sm text-error">{actionError}</p>}
+      {actionError && (
+        <div className="rounded-lg border border-error/40 bg-error/5 px-4 py-3 text-sm text-error">
+          {actionError}
+        </div>
+      )}
 
       {loading ? (
         <p className="text-sm text-muted">Loading…</p>
       ) : posts.length === 0 ? (
-        <p className="rounded border border-border bg-surface px-4 py-3 text-sm text-muted">
-          Nothing scheduled yet.{" "}
-          <Link href="/scheduler/compose" className="underline">
+        <div className="rounded-xl border border-dashed border-border px-6 py-12 text-center">
+          <p className="text-sm text-muted">Nothing scheduled yet.</p>
+          <Link
+            href="/scheduler/compose"
+            className="mt-3 inline-block rounded-lg border border-border bg-surface px-4 py-2 text-sm font-medium transition hover:bg-background"
+          >
             Schedule your first post
           </Link>
-          .
-        </p>
+        </div>
       ) : (
         Object.entries(grouped).map(([day, dayPosts]) => (
           <section key={day} className="space-y-2">
             <h2 className="text-sm font-medium text-muted">{day}</h2>
-            <ul className="space-y-2">
+            <div className="grid gap-3 lg:grid-cols-2">
               {dayPosts.map((post) => {
                 const status =
                   POST_STATUS_LABELS[post.status] ?? POST_STATUS_LABELS.QUEUED;
@@ -177,57 +192,97 @@ export default function SchedulerPage() {
                   post.status === "QUEUED" ||
                   post.status === "SCHEDULED_REMOTE" ||
                   post.status === "UPLOADING";
+                // Mirrors lib/scheduler/editing.ts. A SCHEDULED_REMOTE post is
+                // editable only on platforms whose adapter can push the change;
+                // the edit page re-checks with the server and explains why if
+                // not, so this only decides whether to offer the link.
+                const editable =
+                  post.status === "QUEUED" ||
+                  post.status === "FAILED" ||
+                  post.status === "CANCELED" ||
+                  (post.status === "SCHEDULED_REMOTE" &&
+                    (post.connectedAccount.platform === "YOUTUBE" ||
+                      post.connectedAccount.platform === "FACEBOOK_PAGE"));
 
                 return (
-                  <li
+                  <article
                     key={post.id}
-                    className="rounded border border-border bg-surface px-4 py-3"
+                    className="flex flex-col justify-between rounded-xl border border-border bg-surface p-4"
                   >
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="min-w-0 space-y-1">
-                        <p className="text-sm">
-                          <span className="font-medium">
+                    <div className="flex items-start gap-3">
+                      <AccountAvatar
+                        platform={post.connectedAccount.platform}
+                        avatarUrl={post.connectedAccount.avatarUrl}
+                        displayName={post.connectedAccount.displayName}
+                      />
+
+                      <div className="min-w-0 flex-1 space-y-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-semibold">
                             {new Date(post.scheduledAt).toLocaleTimeString([], {
                               hour: "2-digit",
                               minute: "2-digit",
                             })}
-                          </span>{" "}
-                          <span className="text-muted">
-                            {platform?.label} · {post.connectedAccount.displayName}
                           </span>
+                          <span className="truncate text-sm text-muted">
+                            {post.connectedAccount.displayName}
+                          </span>
+                        </div>
+                        <p className="text-xs text-muted">
+                          {platform?.label} ·{" "}
+                          {platform?.mediaTypes.find(
+                            (t) => t.value === post.mediaType
+                          )?.label ?? post.mediaType}
                         </p>
                         {post.caption && (
-                          <p className="truncate text-sm text-muted">
+                          <p className="line-clamp-2 text-sm text-muted">
                             {post.caption}
-                          </p>
-                        )}
-                        {post.lastError && (
-                          <p
-                            className={`text-sm ${
-                              post.status === "FAILED"
-                                ? "text-error"
-                                : "text-muted"
-                            }`}
-                          >
-                            {post.lastError}
-                          </p>
-                        )}
-                        {post.attemptCount > 1 && (
-                          <p className="text-sm text-muted">
-                            {post.attemptCount} attempts
                           </p>
                         )}
                       </div>
 
-                      <div className="flex shrink-0 items-center gap-3">
-                        <span className={`text-sm ${status.text}`}>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <span
+                          className={`h-1.5 w-1.5 rounded-full ${STATUS_DOT[post.status] ?? "bg-border"}`}
+                        />
+                        <span className={`text-xs ${status.text}`}>
                           {status.label}
                         </span>
+                      </span>
+                    </div>
+
+                    {post.lastError && (
+                      <p
+                        className={`mt-3 rounded-md px-2.5 py-2 text-xs leading-5 ${
+                          post.status === "FAILED"
+                            ? "border border-error/30 bg-error/5 text-error"
+                            : "border border-border bg-background text-muted"
+                        }`}
+                      >
+                        {post.lastError}
+                      </p>
+                    )}
+
+                    <div className="mt-3 flex items-center justify-between border-t border-border pt-3">
+                      <span className="text-xs text-muted">
+                        {post.attemptCount > 1
+                          ? `${post.attemptCount} attempts`
+                          : ""}
+                      </span>
+                      <div className="flex items-center gap-3">
+                        {editable && (
+                          <Link
+                            href={`/scheduler/posts/${post.id}/edit`}
+                            className="text-xs transition hover:underline"
+                          >
+                            Edit
+                          </Link>
+                        )}
                         {pending && (
                           <button
                             onClick={() => void act(post, "cancel")}
                             disabled={busy === post.id}
-                            className="text-sm text-muted hover:underline disabled:opacity-50"
+                            className="text-xs text-muted transition hover:text-error disabled:opacity-50"
                           >
                             Cancel
                           </button>
@@ -237,17 +292,17 @@ export default function SchedulerPage() {
                           <button
                             onClick={() => void act(post, "retry")}
                             disabled={busy === post.id}
-                            className="text-sm hover:underline disabled:opacity-50"
+                            className="text-xs transition hover:underline disabled:opacity-50"
                           >
                             Retry
                           </button>
                         )}
                       </div>
                     </div>
-                  </li>
+                  </article>
                 );
               })}
-            </ul>
+            </div>
           </section>
         ))
       )}

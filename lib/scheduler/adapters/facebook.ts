@@ -270,6 +270,43 @@ export const facebookAdapter: PublishAdapter = {
     };
   },
 
+  /**
+   * Edit a post Facebook is already holding.
+   *
+   * Meta documents that scheduled posts are updated via `POST /{post-id}` — but
+   * it never enumerates which fields are editable for a scheduled *video*, and
+   * for Reels it documents editing not at all. So this is a best-effort call
+   * against an unconfirmed surface. It throws on failure rather than swallowing
+   * the error, so the caller leaves our row untouched instead of recording an
+   * edit Facebook never accepted.
+   */
+  async update(post: ScheduledPost, account: ConnectedAccount) {
+    if (!post.platformPostId) {
+      throw new PublishError(
+        "This Facebook post has no ID recorded, so it cannot be edited",
+        false
+      );
+    }
+
+    const accessPlaintextToken = await resolveAccessToken(account);
+    const options = (post.platformOptions ?? {}) as FacebookOptions;
+
+    await metaRequest(
+      `${graphBase()}/${post.platformPostId}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          access_token: accessPlaintextToken,
+          description: post.caption,
+          ...(options.title ? { title: options.title } : {}),
+          scheduled_publish_time: toUnixSeconds(post.scheduledAt),
+        }).toString(),
+      },
+      "Facebook edit"
+    );
+  },
+
   async cancel(post: ScheduledPost, account: ConnectedAccount) {
     if (!post.platformPostId) return;
 

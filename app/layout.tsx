@@ -2,15 +2,29 @@ import type { Metadata } from "next";
 import { Analytics } from "@vercel/analytics/next";
 import "./globals.css";
 
+/* `applicationName` and `openGraph.siteName` both render the app name into the
+   document head. Google's OAuth verification checks that the name on the
+   consent screen matches the name on the home page, so these MUST stay exactly
+   "OpenReply" — the same string configured in the Google Cloud console and in
+   the Meta app dashboard. Do not append a tagline to them. */
 export const metadata: Metadata = {
-  title: "OpenReply - Open source Instagram comment-to-DM automation",
+  metadataBase: new URL(process.env.NEXTAUTH_URL ?? "http://localhost:3000"),
+  applicationName: "OpenReply",
+  title: "OpenReply - Instagram comment-to-DM automation and video scheduling",
   description:
-    "A free, self-hosted ManyChat alternative. Send an Instagram DM automatically when someone comments a keyword on your post or reel, using the official Meta API.",
+    "OpenReply is a free, self-hosted social media tool. It sends an automatic Instagram DM when someone comments your keyword on a post or reel, and schedules your videos to Instagram, TikTok, YouTube and Facebook Pages — all through the platforms' official APIs.",
+  openGraph: {
+    siteName: "OpenReply",
+    title: "OpenReply - Instagram comment-to-DM automation and video scheduling",
+    description:
+      "Free, self-hosted comment-to-DM automation and multi-platform video scheduling, built on the official Meta, Google and TikTok APIs.",
+    type: "website",
+  },
   keywords: [
     "instagram automation",
     "comment to DM",
     "instagram private replies",
-    "social commerce",
+    "social media scheduler",
     "manychat alternative",
   ],
 };

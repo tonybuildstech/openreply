@@ -123,6 +123,111 @@ describe("local media storage", () => {
   });
 });
 
+/**
+ * Regression cover for a silent corruption bug: the upload route counted bytes
+ * with a `data` listener on the request body, which drained whatever had
+ * already arrived before `put()` finished its mkdir and started piping. Files
+ * reached disk missing their head — an MP4 with no `ftyp` box — and nothing
+ * failed until YouTube rejected the video during transcode.
+ *
+ * These tests feed a body whose first chunks are ALREADY buffered, which is the
+ * normal case in production: the handler awaits an auth/workspace lookup while
+ * the client keeps uploading.
+ */
+describe("upload byte cap", () => {
+  /** A body where the first `readyChunks` resolve instantly, the rest trickle. */
+  function bufferedBody(payload: Buffer, readyChunks: number, chunkSize = 4096) {
+    let offset = 0;
+    let pulls = 0;
+
+    return new ReadableStream({
+      async pull(controller) {
+        if (offset >= payload.length) {
+          controller.close();
+          return;
+        }
+        if (pulls++ >= readyChunks) {
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+        const size = Math.min(chunkSize, payload.length - offset);
+        controller.enqueue(new Uint8Array(payload.subarray(offset, offset + size)));
+        offset += size;
+      },
+    });
+  }
+
+  /** A minimal MP4 head — the part that used to get eaten. */
+  function fakeMp4(totalBytes: number): Buffer {
+    const buffer = Buffer.alloc(totalBytes);
+    buffer.writeUInt32BE(0x20, 0);
+    buffer.write("ftypisom", 4, "ascii");
+    for (let i = 12; i < totalBytes; i++) buffer[i] = i & 0xff;
+    return buffer;
+  }
+
+  it.each([0, 8, 32])(
+    "stores every byte when %i chunks are already buffered",
+    async (readyChunks) => {
+      const storage = await loadStorage();
+      const { capUploadBytes } = await import("../lib/storage/byte-cap");
+      const payload = fakeMp4(256 * 1024);
+
+      const source = Readable.fromWeb(
+        bufferedBody(payload, readyChunks) as never
+      );
+      const meta = await storage.put(
+        "ws1/buffered.mp4",
+        capUploadBytes(source, 10 * 1024 * 1024),
+        { contentType: "video/mp4" }
+      );
+
+      expect(meta.size).toBe(payload.length);
+
+      const chunks: Buffer[] = [];
+      for await (const chunk of storage.createReadStream("ws1/buffered.mp4")) {
+        chunks.push(chunk as Buffer);
+      }
+      const stored = Buffer.concat(chunks);
+
+      // Byte-for-byte, and the container header specifically.
+      expect(stored.equals(payload)).toBe(true);
+      expect(stored.subarray(4, 8).toString("ascii")).toBe("ftyp");
+    }
+  );
+
+  it("still rejects a body that exceeds the cap", async () => {
+    const storage = await loadStorage();
+    const { capUploadBytes, UPLOAD_TOO_LARGE } = await import(
+      "../lib/storage/byte-cap"
+    );
+
+    const source = Readable.fromWeb(bufferedBody(fakeMp4(64 * 1024), 4) as never);
+
+    await expect(
+      storage.put("ws1/toobig.mp4", capUploadBytes(source, 8 * 1024), {
+        contentType: "video/mp4",
+      })
+    ).rejects.toThrow(UPLOAD_TOO_LARGE);
+  });
+
+  it("surfaces a request body that fails mid-flight instead of hanging", async () => {
+    const storage = await loadStorage();
+    const { capUploadBytes } = await import("../lib/storage/byte-cap");
+
+    const source = new Readable({
+      read() {
+        this.destroy(new Error("client disconnected"));
+      },
+    });
+
+    await expect(
+      storage.put("ws1/aborted.mp4", capUploadBytes(source, 1024 * 1024), {
+        contentType: "video/mp4",
+      })
+    ).rejects.toThrow(/client disconnected/);
+  });
+});
+
 describe("media keys", () => {
   it("shards by workspace and month, and keeps the right extension", async () => {
     const { buildMediaKey } = await import("../lib/storage");

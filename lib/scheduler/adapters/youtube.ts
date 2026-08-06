@@ -45,12 +45,51 @@ const VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos";
  */
 const CHUNK_BYTES = 8 * 1024 * 1024;
 
+/**
+ * How many consecutive chunk PUTs may store nothing before we give up.
+ *
+ * A 308 that reports no forward progress is legitimate transiently, so a couple
+ * of re-sends are correct. Unbounded, they are not: each attempt re-uploads up
+ * to 8 MB with a 10-minute timeout, so a wedged session would occupy the worker
+ * until PM2's memory cap killed it — and because the worker is single-process,
+ * every other scheduled post queues behind it.
+ */
+const MAX_STALLED_CHUNK_ATTEMPTS = 5;
+
+/** Linear backoff between stalled re-sends: 1s, 2s, 3s, 4s. */
+const STALLED_CHUNK_BACKOFF_MS = 1_000;
+
+/**
+ * Resume position from a resumable-upload 308, or null if YouTube reported
+ * nothing usable.
+ *
+ * The header is `Range: bytes=0-262143`, where the last byte is the last one
+ * YouTube actually STORED — not the last one we sent. Parsing is strict on
+ * purpose: a malformed header must read as "no progress" and be retried, never
+ * be coerced into a plausible-looking offset that silently corrupts the upload.
+ */
+export function parseResumeOffset(rangeHeader: string | null): number | null {
+  const match = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader?.trim() ?? "");
+  if (!match) return null;
+
+  const lastByte = Number(match[2]);
+  return Number.isSafeInteger(lastByte) ? lastByte + 1 : null;
+}
+
 interface YouTubeOptions {
   title?: string;
   description?: string;
   categoryId?: string;
-  tags?: string[];
+  /** Comma-separated in the composer; the API wants an array. */
+  tags?: string;
   madeForKids?: boolean;
+}
+
+export function toTagList(tags: string | undefined): string[] {
+  return (tags ?? "")
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter(Boolean);
 }
 
 /** Metadata for a channel, cached on ConnectedAccount.metadata at connect time. */
@@ -114,7 +153,10 @@ async function startSession(
         post.caption.split("\n")[0]?.slice(0, 100) ||
         "Untitled",
       description: options.description ?? post.caption,
-      ...(options.tags?.length ? { tags: options.tags } : {}),
+      // The composer collects a comma-separated string; the API wants an array.
+      ...(toTagList(options.tags).length
+        ? { tags: toTagList(options.tags) }
+        : {}),
       categoryId: options.categoryId ?? "22",
     },
     status: {
@@ -176,6 +218,7 @@ async function uploadChunks(
 ): Promise<Record<string, unknown>> {
   const storage = getMediaStorage();
   let offset = 0;
+  let stalledAttempts = 0;
 
   while (offset < sizeBytes) {
     const end = Math.min(offset + CHUNK_BYTES, sizeBytes) - 1;
@@ -198,11 +241,38 @@ async function uploadChunks(
     } as RequestInit & { duplex: "half"; timeoutMs: number });
 
     if (response.status === 308) {
-      const range = response.headers.get("range");
-      // "bytes=0-1048575" → resume at 1048576. No Range header means YouTube
-      // stored nothing yet, so we re-send from the same offset.
-      const lastByte = range ? Number(range.split("-")[1]) : NaN;
-      offset = Number.isFinite(lastByte) ? lastByte + 1 : offset;
+      const resumeAt = parseResumeOffset(response.headers.get("range"));
+
+      // YouTube is authoritative about what it actually stored. A missing or
+      // unreadable Range means nothing landed; a value below our own position
+      // means it kept less than we sent and we have to rewind. Either way the
+      // next offset comes from its answer, never from our arithmetic.
+      const nextOffset = resumeAt ?? offset;
+
+      if (nextOffset > offset) {
+        offset = nextOffset;
+        stalledAttempts = 0;
+        continue;
+      }
+
+      offset = nextOffset;
+      stalledAttempts += 1;
+
+      if (stalledAttempts >= MAX_STALLED_CHUNK_ATTEMPTS) {
+        // Retryable: the job restarts with a fresh upload session, which is the
+        // only way out of a wedged one. It costs another 1,600 quota units, so
+        // this deliberately does not retry more than a handful of times first.
+        throw new PublishError(
+          `YouTube upload stalled at byte ${offset} of ${sizeBytes} — ${MAX_STALLED_CHUNK_ATTEMPTS} consecutive chunks stored nothing`,
+          true
+        );
+      }
+
+      // Back off before re-sending; an immediate retry of an 8 MB chunk against
+      // a session that just refused it wastes the VPS's bandwidth.
+      await new Promise((resolve) =>
+        setTimeout(resolve, STALLED_CHUNK_BACKOFF_MS * stalledAttempts)
+      );
       continue;
     }
 
@@ -302,6 +372,64 @@ export const youtubeAdapter: PublishAdapter = {
     // "public" only arrives once publishAt has fired (and the project is
     // audited). Anything else is still waiting.
     return item.status?.privacyStatus === "private" ? "pending" : "published";
+  },
+
+  /**
+   * Edit a video YouTube is already holding.
+   *
+   * Two traps here. First, `videos.update` **replaces** every part it is given,
+   * so omitting a field inside `snippet` clears it — the whole snippet has to be
+   * resent from our record, not just the changed field. Second, `publishAt` is
+   * only accepted while the video is private and has never been published,
+   * which is exactly the SCHEDULED_REMOTE state and no other.
+   */
+  async update(post: ScheduledPost, account: ConnectedAccount) {
+    if (!post.platformPostId) {
+      throw new PublishError(
+        "This YouTube video has no ID recorded, so it cannot be edited",
+        false
+      );
+    }
+
+    const accessPlaintextToken = await resolveAccessToken(account);
+    const options = (post.platformOptions ?? {}) as YouTubeOptions;
+
+    await googleRequest(
+      `${VIDEOS_URL}?part=snippet,status`,
+      {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${accessPlaintextToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: post.platformPostId,
+          snippet: {
+            title:
+              options.title?.trim() ||
+              post.caption.split("\n")[0]?.slice(0, 100) ||
+              "Untitled",
+            description: options.description ?? post.caption,
+            ...(toTagList(options.tags).length
+              ? { tags: toTagList(options.tags) }
+              : {}),
+            categoryId: options.categoryId ?? "22",
+          },
+          status: {
+            // Must stay private for publishAt to remain valid.
+            privacyStatus: "private",
+            publishAt: post.scheduledAt.toISOString(),
+            selfDeclaredMadeForKids: options.madeForKids ?? false,
+          },
+        }),
+      },
+      "YouTube edit"
+    );
+
+    await recordQuotaUsage({
+      platform: "YOUTUBE",
+      units: YOUTUBE_UPDATE_UNIT_COST,
+    });
   },
 
   async cancel(post: ScheduledPost, account: ConnectedAccount) {

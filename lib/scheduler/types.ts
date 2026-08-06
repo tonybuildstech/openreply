@@ -60,6 +60,18 @@ export interface PublishAdapter {
    * the platform to publish anyway — so the UI's cancel button depends on it.
    */
   cancel?(post: ScheduledPost, account: ConnectedAccount): Promise<void>;
+
+  /**
+   * Push an edit to a post the platform is already holding
+   * (`SCHEDULED_REMOTE`). Only meaningful for natively-scheduled platforms;
+   * queued platforms are edited in our database alone because nothing has been
+   * sent yet.
+   *
+   * `post` is the ALREADY-UPDATED record, so the adapter reads the new values
+   * straight off it. Implementations must throw rather than partially apply —
+   * the caller only commits the row once this resolves.
+   */
+  update?(post: ScheduledPost, account: ConnectedAccount): Promise<void>;
 }
 
 /**

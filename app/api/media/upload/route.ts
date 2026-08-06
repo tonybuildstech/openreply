@@ -6,6 +6,7 @@ import {
   buildMediaKey,
   getMediaStorage,
 } from "@/lib/storage";
+import { UPLOAD_TOO_LARGE, capUploadBytes } from "@/lib/storage/byte-cap";
 import {
   canManageWorkspace,
   getCurrentWorkspaceContext,
@@ -84,19 +85,16 @@ export async function POST(request: NextRequest) {
 
   // Content-Length is a client claim. Count the real bytes as they pass and
   // abort the moment the cap is crossed, so a lying header cannot fill the disk.
-  let bytesSeen = 0;
+  // The counting happens inside the pipeline — see `capUploadBytes` for why a
+  // `data` listener here silently truncated every upload.
   const source = Readable.fromWeb(
     request.body as unknown as Parameters<typeof Readable.fromWeb>[0]
   );
-  source.on("data", (chunk: Buffer) => {
-    bytesSeen += chunk.length;
-    if (bytesSeen > maxBytes) {
-      source.destroy(new Error("UPLOAD_TOO_LARGE"));
-    }
-  });
 
   try {
-    const meta = await storage.put(key, source, { contentType });
+    const meta = await storage.put(key, capUploadBytes(source, maxBytes), {
+      contentType,
+    });
 
     return NextResponse.json({
       success: true,
@@ -111,7 +109,7 @@ export async function POST(request: NextRequest) {
     // Best-effort cleanup: a partial file is useless and still occupies disk.
     await storage.delete(key).catch(() => {});
 
-    if (error instanceof Error && error.message === "UPLOAD_TOO_LARGE") {
+    if (error instanceof Error && error.message === UPLOAD_TOO_LARGE) {
       return NextResponse.json(
         {
           success: false,
