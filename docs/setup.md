@@ -213,6 +213,99 @@ Hit `/api/health` any time. It reports the database, Redis, queue, and worker he
 
 If you want to inspect where a comment stopped, the Postgres tables tell you: `WebhookEvent` for delivery, `DmLog` for send status and errors, `OperationalEvent` for worker crashes and the polling reconciler's sweep logs.
 
+## The content scheduler (optional)
+
+The scheduler is a separate feature from comment-to-DM. It queues short-form video
+and publishes it to Instagram, TikTok, YouTube, and Facebook Pages. It shares the
+database and worker but nothing else — you can ignore this whole section and the DM
+automation still works.
+
+**Everything here is optional and per platform.** A platform with no credentials just
+cannot be connected; nothing else breaks.
+
+### Where video files are stored
+
+Set `MEDIA_STORAGE_DIR` to a directory **outside** your deploy directory:
+
+```bash
+sudo mkdir -p /var/lib/openreply/media
+sudo chown "$USER" /var/lib/openreply/media
+```
+
+This matters more than it looks. The deploy workflow syncs with `rsync --delete`, so
+anything stored under the app directory is erased on the next deploy — after the posts
+referencing it were already scheduled. Keep media somewhere `rsync` never touches.
+
+### Two platforms schedule for themselves, two do not
+
+| Platform | Who holds the timer |
+|----------|--------------------|
+| YouTube, Facebook Pages | The platform. The video uploads immediately and publishes at your chosen time — even if OpenReply is offline. |
+| Instagram, TikTok | **OpenReply's worker.** Neither API has a scheduling parameter of any kind, so the worker uploads at the scheduled minute. **If the worker is not running, these do not publish.** |
+
+### Instagram
+
+Publishing needs the `instagram_business_content_publish` permission, which is a
+**separate App Review submission** from the messaging permissions used by comment-to-DM.
+Neither approval depends on the other. Add the permission in your existing Meta app,
+then connect the account again under Scheduler, Connections — the DM connection does not
+grant publishing.
+
+Limit: 25 posts per rolling 24 hours, which OpenReply checks with Instagram before each
+publish.
+
+### Facebook Pages
+
+Same Meta app. Add `pages_show_list`, `pages_read_engagement`, and `pages_manage_posts`,
+and submit them for App Review. Set `FACEBOOK_APP_ID` — it is needed for the resumable
+upload session, not just login.
+
+Connecting shows every Page you can create content on; each becomes its own connected
+account. Limit: 30 Reels published through the API per rolling 24 hours.
+
+### YouTube
+
+Create a Google Cloud project, enable the YouTube Data API v3, and create an OAuth
+client with redirect URI `https://your-domain/api/connections/youtube/callback`. Set
+`GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
+
+**Two things will surprise you, so they are worth reading twice:**
+
+1. **Uploads stay private until Google audits your project.** Any project created after
+   28 July 2020 that has not passed the YouTube API audit has every API upload forced to
+   private — permanently, and scheduling does not change it. The video uploads, the
+   schedule is set, and it simply never becomes public. Apply through the YouTube API
+   Services audit form to lift this.
+2. **Uploads cost 1,600 quota units each, out of 10,000 per day.** That is about **six
+   uploads per day for your entire installation**, not per user. OpenReply tracks this
+   and refuses to schedule past the ceiling rather than failing at publish time. The
+   Connections page shows what is left today.
+
+Also: while your OAuth consent screen is in **Testing**, Google expires refresh tokens
+after **7 days**, so every connected channel stops working weekly. Move the consent
+screen to **Production** and reconnect to avoid it.
+
+### TikTok
+
+Create a TikTok developer app with Login Kit and the Content Posting API, request
+`user.info.basic`, `video.upload`, and `video.publish`, and set `TIKTOK_CLIENT_KEY` and
+`TIKTOK_CLIENT_SECRET`.
+
+**Connected accounts default to inbox delivery**, meaning that at the scheduled minute
+the video is sent to your TikTok inbox and you tap the notification to finish posting.
+This is deliberate. TikTok forces every post from an unaudited app to private
+(`SELF_ONLY`), and their Content Sharing Guidelines require API clients be "intended for
+a wide audience, not limited to internal groups/private use" — which a self-hosted tool
+is not. If your app does pass TikTok's audit, switch an account to direct posting by
+setting `metadata.postMode` to `DIRECT_POST` on its `ConnectedAccount` row.
+
+### About video quality
+
+OpenReply never transcodes, crops, compresses, or re-encodes your file — the original is
+uploaded byte for byte. All four platforms then re-encode on their side and none offers a
+way to opt out, so the final quality is theirs to determine. Upload a good master; that
+is the only lever anyone has.
+
 ## Local development
 
 You need Postgres and Redis. The included `docker-compose.yml` starts both:

@@ -30,6 +30,35 @@ export function getMetaGraphApiVersion(): string {
   return process.env.META_GRAPH_API_VERSION ?? "v25.0";
 }
 
+// ─── Scheduler ──────────────────────────────────────────────────────────────
+
+/**
+ * Where original media files live. MUST resolve outside the deploy directory:
+ * `.github/workflows/deploy.yml` rsyncs with `--delete` and excludes only
+ * `.env`, so anything under the app root is wiped by the next deploy — after
+ * the posts referencing it were already scheduled.
+ */
+export function getMediaStorageDir(): string {
+  return process.env.MEDIA_STORAGE_DIR ?? "/var/lib/openreply/media";
+}
+
+/** Hard ceiling on an accepted upload. The VPS disk is shared with Postgres. */
+export function getMaxUploadBytes(): number {
+  const raw = Number(process.env.MEDIA_MAX_UPLOAD_BYTES);
+  return Number.isFinite(raw) && raw > 0 ? raw : 2 * 1024 * 1024 * 1024;
+}
+
+/**
+ * YouTube's default project quota is 10,000 units/day and videos.insert costs
+ * 1,600, so this ceiling allows ~6 uploads/day across the WHOLE project. Raise
+ * it only after Google grants a quota extension.
+ * Source: developers.google.com/youtube/v3/determine_quota_cost (2026-08-09).
+ */
+export function getYouTubeDailyQuotaUnits(): number {
+  const raw = Number(process.env.YOUTUBE_DAILY_QUOTA_UNITS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 10_000;
+}
+
 export const serverEnvSchema = z.object({
   NEXTAUTH_URL: z.string().url(),
   NEXTAUTH_SECRET: z.string().min(16),

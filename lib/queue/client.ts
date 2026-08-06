@@ -47,6 +47,42 @@ export type DmQueueJob = ProcessCommentJob | ProcessPostbackJob;
 
 export const POSTBACK_JOB_NAME = "process-postback";
 
+// ─── Publish Queue ──────────────────────────────────────────────────────────
+
+export interface PublishPostJob {
+  scheduledPostId: string;
+}
+
+export const PUBLISH_QUEUE_NAME = "publish-processing";
+
+let publishQueue: Queue<PublishPostJob> | null = null;
+
+/**
+ * Queue for the scheduler's fire-time publishing (Instagram and TikTok, the
+ * two platforms with no scheduling API). Separate from the DM queue because a
+ * video upload takes minutes and must never sit behind — or hold up — the
+ * latency-sensitive DM stream.
+ */
+export function getPublishQueue(): Queue<PublishPostJob> {
+  if (!publishQueue) {
+    publishQueue = new Queue<PublishPostJob>(PUBLISH_QUEUE_NAME, {
+      connection: getRedisConnection(),
+      defaultJobOptions: {
+        removeOnComplete: { count: 500 },
+        // Failures here are user-visible and their cause matters, so failed
+        // jobs are kept far longer than the DM queue keeps its own. The real
+        // record lives in PublishJobLog either way.
+        removeOnFail: { age: 7 * 24 * 60 * 60, count: 1000 },
+        attempts: 3,
+        // 30s → 2m → 8m. Long enough for a rate-limit window to roll over,
+        // short enough that a scheduled post is not hours late.
+        backoff: { type: "exponential", delay: 30_000 },
+      },
+    });
+  }
+  return publishQueue;
+}
+
 let dmQueue: Queue<DmQueueJob> | null = null;
 
 export function getDMQueue(): Queue<DmQueueJob> {

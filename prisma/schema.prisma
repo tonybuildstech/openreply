@@ -85,6 +85,8 @@ model Workspace {
   linkClicks        LinkClick[]
   webhookEvents     WebhookEvent[]
   operationalEvents OperationalEvent[]
+  connectedAccounts ConnectedAccount[]
+  scheduledPosts    ScheduledPost[]
 
   @@index([ownerId])
 }
@@ -311,6 +313,176 @@ model OperationalEvent {
   @@index([source])
   @@index([level])
   @@index([createdAt])
+}
+
+// ─── Multi-platform content scheduler ────────────────────────────────────────
+//
+// One external publishing account (an IG professional account, a Facebook Page,
+// a YouTube channel, a TikTok account). Distinct from InstagramAccount, which
+// belongs to the comment→DM feature and carries messaging scopes: the two use
+// different App Review tracks and are deliberately not merged.
+model ConnectedAccount {
+  id          String        @id @default(cuid())
+  workspaceId String
+  platform    SocialPlatform
+
+  // Page ID / IG user ID / YouTube channel ID / TikTok open_id.
+  platformAccountId String
+  displayName       String
+  avatarUrl         String?
+
+  // AES-256-GCM, base64 (iv|authTag|ciphertext) — same cipher and key as
+  // InstagramAccount.accessToken. Never stored or logged in plaintext.
+  accessToken    String
+  refreshToken   String?
+  tokenExpiresAt DateTime?
+
+  // What the platform actually granted, not what we asked for.
+  scopes String[]
+
+  // Platform-specific state that has no schema of its own: IG account type,
+  // YouTube channel thumbnail, Page category, TikTok post mode + creator limits.
+  metadata Json?
+
+  status ConnectedAccountStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workspace      Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  scheduledPosts ScheduledPost[]
+  quotaUsage     PlatformQuotaUsage[]
+
+  // The same external account cannot be linked twice, but a workspace may link
+  // unlimited distinct accounts per platform.
+  @@unique([workspaceId, platform, platformAccountId])
+  @@index([workspaceId])
+  @@index([status])
+}
+
+model ScheduledPost {
+  id                 String @id @default(cuid())
+  // Denormalised so the calendar can query a workspace's posts without a join,
+  // matching DmLog and LinkClick.
+  workspaceId        String
+  connectedAccountId String
+
+  // Key into the media store (lib/storage). Points at the ORIGINAL file — this
+  // pipeline never transcodes.
+  mediaStorageKey String
+  mediaMimeType   String
+  mediaSizeBytes  BigInt
+
+  mediaType ScheduledPostMediaType
+  caption   String                 @default("")
+
+  // Per-platform options that only one platform understands: TikTok
+  // privacy_level and interaction toggles, YouTube title/categoryId,
+  // IG share_to_feed, FB Reels vs feed. Validated per platform at creation.
+  platformOptions Json?
+
+  scheduledAt DateTime
+  status      ScheduledPostStatus @default(QUEUED)
+
+  // Populated after a successful publish / native schedule.
+  platformPostId      String?
+  // IG container ID, TikTok publish_id, YouTube video ID, FB video ID — the
+  // handle used to poll status.
+  platformContainerId String?
+
+  lastError    String?
+  attemptCount Int       @default(0)
+  publishedAt  DateTime?
+
+  // One composer submission fanning out to N accounts shares a batch, so the
+  // UI can group "this video, 4 accounts" as a single card.
+  batchId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workspace        Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  connectedAccount ConnectedAccount @relation(fields: [connectedAccountId], references: [id], onDelete: Cascade)
+  jobLogs          PublishJobLog[]
+
+  // Exactly the fire-time poll's predicate.
+  @@index([status, scheduledAt])
+  @@index([workspaceId, scheduledAt])
+  @@index([connectedAccountId])
+  @@index([batchId])
+}
+
+// Append-only audit trail. responseSnippet is truncated and scrubbed before
+// write — platform errors echo request context and must never carry a token.
+model PublishJobLog {
+  id              String   @id @default(cuid())
+  scheduledPostId String
+  attempt         Int
+  status          String
+  responseSnippet String?
+  createdAt       DateTime @default(now())
+
+  scheduledPost ScheduledPost @relation(fields: [scheduledPostId], references: [id], onDelete: Cascade)
+
+  @@index([scheduledPostId])
+  @@index([createdAt])
+}
+
+// Daily counters we must track ourselves because the platform gives us no
+// pre-flight endpoint. YouTube rows are project-wide (connectedAccountId null,
+// 1600 units per upload against a 10,000/day default); TikTok and Facebook
+// Reels rows are per-account post counts.
+model PlatformQuotaUsage {
+  id                 String         @id @default(cuid())
+  platform           SocialPlatform
+  connectedAccountId String?
+  // UTC date bucket (midnight-normalised).
+  date               DateTime
+  unitsUsed          Int            @default(0)
+  postsCount         Int            @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  connectedAccount ConnectedAccount? @relation(fields: [connectedAccountId], references: [id], onDelete: Cascade)
+
+  @@unique([platform, connectedAccountId, date])
+  @@index([platform, date])
+}
+
+enum SocialPlatform {
+  FACEBOOK_PAGE
+  INSTAGRAM
+  YOUTUBE
+  TIKTOK
+}
+
+enum ConnectedAccountStatus {
+  ACTIVE
+  // Refresh failed permanently (Google invalid_grant, TikTok auth_removed,
+  // Meta code 190). A first-class state, not an error string.
+  NEEDS_REAUTH
+  DISABLED
+}
+
+enum ScheduledPostMediaType {
+  REEL
+  SHORT
+  TIKTOK_VIDEO
+  FACEBOOK_REEL
+  FACEBOOK_VIDEO
+}
+
+enum ScheduledPostStatus {
+  QUEUED
+  UPLOADING
+  PUBLISHING
+  // Natively scheduled by the platform (YouTube publishAt, FB
+  // scheduled_publish_time). Upload is done; the platform holds the timer.
+  SCHEDULED_REMOTE
+  PUBLISHED
+  FAILED
+  CANCELED
 }
 
 enum WorkspaceRole {
