@@ -257,6 +257,28 @@ export default function EditScheduledPostPage() {
           {/* Media */}
           <section className="rounded-xl border border-border bg-surface p-5">
             <h2 className="mb-4 text-base font-semibold">Video</h2>
+            {/* Already-uploaded media, served through the session-gated
+                preview route. The signed public URL cannot be used here: it is
+                minted for Meta's fetcher and throws on a localhost base URL. */}
+            <div className="mb-3 flex max-h-56 items-center justify-center overflow-hidden rounded-lg border border-border bg-background">
+              {currentMedia.kind === "IMAGE" ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={`/api/media/preview/${currentMedia.storageKey}`}
+                  alt="Scheduled media"
+                  className="max-h-56 max-w-full object-contain"
+                />
+              ) : (
+                <video
+                  src={`/api/media/preview/${currentMedia.storageKey}`}
+                  controls
+                  muted
+                  playsInline
+                  className="max-h-56 max-w-full object-contain"
+                />
+              )}
+            </div>
+
             <div className="rounded-lg border border-border bg-background px-4 py-3">
               <p className="truncate text-sm font-medium">
                 {newMedia

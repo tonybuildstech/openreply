@@ -19,12 +19,18 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 /**
- * Accepts the ORIGINAL video file and streams it straight to media storage.
+ * Accepts a media file and streams it straight to storage.
  *
  * Deliberately absent: any transcode, compression, thumbnail, or probe pass.
- * The master is stored byte-for-byte as the user sent it. (Every platform
- * re-encodes on their side — see the research findings — but that is theirs to
- * do, not ours.)
+ * Whatever arrives is stored byte-for-byte. (Every platform re-encodes on their
+ * side — see the research findings — but that is theirs to do, not ours.)
+ *
+ * One caveat, so this comment does not read as a stronger promise than it is:
+ * the composer can crop a PHOTO in the browser before sending it here, and only
+ * ever after an explicit click (`lib/media/crop-image.ts`). That happens because
+ * Instagram rejects out-of-range stills rather than cropping them. From this
+ * route's point of view the cropped JPEG simply IS the file — nothing
+ * server-side re-encodes anything, ever.
  *
  * The body is sent as a raw stream rather than multipart/form-data: parsing
  * multipart would mean buffering the file, and the web process is capped at

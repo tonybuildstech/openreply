@@ -219,10 +219,21 @@ If you want to inspect where a comment stopped, the Postgres tables tell you: `W
 
 ## The content scheduler (optional)
 
-The scheduler is a separate feature from comment-to-DM. It queues short-form video
-and publishes it to Instagram, TikTok, YouTube, and Facebook Pages. It shares the
-database and worker but nothing else — you can ignore this whole section and the DM
-automation still works.
+The scheduler is a separate feature from comment-to-DM. It queues posts and publishes
+them to Instagram, TikTok, YouTube, and Facebook Pages. It shares the database and
+worker but nothing else — you can ignore this whole section and the DM automation still
+works.
+
+**What each platform can publish:**
+
+| Platform | Post types |
+|---|---|
+| Instagram | Reels, single photos, and **carousels of 2–10 photos and videos** |
+| TikTok · YouTube · Facebook Pages | a single video per post |
+
+Only Instagram accepts a still image or more than one file. Selecting several files
+disables the other platforms in the composer, with the reason shown — schedule a
+carousel to Instagram on its own.
 
 **Everything here is optional and per platform.** A platform with no credentials just
 cannot be connected; nothing else breaks.
@@ -321,12 +332,41 @@ a wide audience, not limited to internal groups/private use" — which a self-ho
 is not. If your app does pass TikTok's audit, switch an account to direct posting by
 setting `metadata.postMode` to `DIRECT_POST` on its `ConnectedAccount` row.
 
-### About video quality
+### About media quality
 
-OpenReply never transcodes, crops, compresses, or re-encodes your file — the original is
-uploaded byte for byte. All four platforms then re-encode on their side and none offers a
-way to opt out, so the final quality is theirs to determine. Upload a good master; that
-is the only lever anyone has.
+**Video is never touched.** OpenReply does not transcode, crop, compress, or re-encode
+video — the original is uploaded byte for byte. All four platforms then re-encode on
+their side and none offers a way to opt out, so the final quality is theirs to determine.
+Upload a good master; that is the only lever anyone has.
+
+**Photos have one deliberate exception**, and only when you ask for it. Instagram
+**rejects** feed photos outside a 4:5 to 1.91:1 aspect ratio rather than cropping them,
+so an out-of-range photo cannot be published at all as-is. The composer refuses to
+schedule one and offers a crop; accepting that crop re-encodes the photo as JPEG in your
+browser before upload. Leave the ratio on **Original** and the file goes up untouched,
+exactly like video.
+
+Instagram's documented photo limits:
+
+| Limit | Value |
+|---|---|
+| Aspect ratio | 4:5 to 1.91:1 (photos outside this are rejected) |
+| Maximum file size | 8 MiB |
+| Format | JPEG |
+
+Meta publishes no list of accepted image formats at all, so OpenReply accepts JPEG only —
+the one format that is reliably reported to work. Cropping also converts PNG to JPEG, so
+picking any ratio other than Original is a way through for a PNG.
+
+### Adding music to a post
+
+You cannot, through any API, on this setup. Instagram's Audio API — the one that attaches
+licensed music — is available **only to apps using Facebook Login, and only for Reels**.
+OpenReply connects Instagram accounts with Instagram Login, so no audio can be attached
+to any post type.
+
+The two options are to bake the audio into the video before uploading, or to add a track
+in the Instagram app after the post goes live.
 
 ## Local development
 
