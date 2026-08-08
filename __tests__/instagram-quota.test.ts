@@ -24,6 +24,9 @@ vi.mock("@/lib/storage/public-url", () => ({
 }));
 
 const post = {
+  // Required since step 4: the adapter branches on post shape and refuses one
+  // it has no path for, rather than defaulting to Reels.
+  mediaType: "REEL",
   caption: "",
   // One media row at position 0 — the shape every post has had since the
   // ScheduledPostMedia migration. Adapters read storage keys from here.

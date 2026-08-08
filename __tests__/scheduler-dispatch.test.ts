@@ -8,10 +8,15 @@ import {
 import { toUserTagsParam } from "../lib/scheduler/adapters/instagram";
 import { toTagList } from "../lib/scheduler/adapters/youtube";
 import {
+  derivePostType,
+  selectionBlocker,
+} from "../components/scheduler/platform-meta";
+import {
   MEDIA_SHAPE_BY_POST_TYPE,
   MEDIA_TYPE_BY_PLATFORM,
   PublishError,
   requireSingleMedia,
+  SCHEDULED_POST_TYPES,
 } from "../lib/scheduler/types";
 
 /**
@@ -224,6 +229,117 @@ describe("media shape per post type", () => {
     for (const types of Object.values(MEDIA_TYPE_BY_PLATFORM)) {
       for (const type of types) {
         expect(MEDIA_SHAPE_BY_POST_TYPE[type]).toBeDefined();
+      }
+    }
+  });
+
+  /**
+   * The API's zod enums are built from SCHEDULED_POST_TYPES. If that tuple
+   * drifts from the shape map, a post type is either accepted by the API with
+   * no rules to validate it against, or rejected despite being publishable.
+   */
+  it("keeps the API's post-type tuple in step with the shape map", () => {
+    expect([...SCHEDULED_POST_TYPES].sort()).toEqual(
+      Object.keys(MEDIA_SHAPE_BY_POST_TYPE).sort()
+    );
+  });
+
+  it("offers every platform's post types through the API tuple", () => {
+    for (const types of Object.values(MEDIA_TYPE_BY_PLATFORM)) {
+      for (const type of types) {
+        expect(SCHEDULED_POST_TYPES).toContain(type);
+      }
+    }
+  });
+});
+
+/**
+ * What the composer will and will not offer.
+ *
+ * These two decide whether the UI can present a combination the API rejects.
+ * The failure they prevent is specific: a carousel selected against a TikTok
+ * account, accepted by the composer, then either refused at submit (confusing)
+ * or — before `requireSingleMedia` existed — published as one arbitrary item.
+ */
+describe("composer post-type derivation", () => {
+  it("turns two or more Instagram items into a carousel", () => {
+    expect(derivePostType("INSTAGRAM", ["IMAGE", "IMAGE"])).toBe("CAROUSEL");
+    expect(derivePostType("INSTAGRAM", ["IMAGE", "VIDEO"])).toBe("CAROUSEL");
+    expect(derivePostType("INSTAGRAM", ["VIDEO", "VIDEO"])).toBe("CAROUSEL");
+  });
+
+  it("distinguishes a single Instagram photo from a single Reel", () => {
+    expect(derivePostType("INSTAGRAM", ["IMAGE"])).toBe("IMAGE");
+    expect(derivePostType("INSTAGRAM", ["VIDEO"])).toBe("REEL");
+  });
+
+  it("leaves Facebook's Reel-or-feed decision to the user", () => {
+    // The one genuine choice: same file, two valid destinations.
+    expect(derivePostType("FACEBOOK_PAGE", ["VIDEO"])).toBe("FACEBOOK_REEL");
+    expect(derivePostType("FACEBOOK_PAGE", ["VIDEO"], "FACEBOOK_VIDEO")).toBe(
+      "FACEBOOK_VIDEO"
+    );
+  });
+
+  it("gives single-video platforms their only post type", () => {
+    expect(derivePostType("TIKTOK", ["VIDEO"])).toBe("TIKTOK_VIDEO");
+    expect(derivePostType("YOUTUBE", ["VIDEO"])).toBe("SHORT");
+  });
+
+  it("only ever derives a post type the platform actually accepts", () => {
+    const cases: ReadonlyArray<ReadonlyArray<"IMAGE" | "VIDEO">> = [
+      ["VIDEO"],
+      ["IMAGE"],
+      ["IMAGE", "IMAGE"],
+      ["VIDEO", "IMAGE", "VIDEO"],
+    ];
+
+    for (const platform of [...QUEUED_PLATFORMS, ...NATIVE_PLATFORMS]) {
+      for (const kinds of cases) {
+        const derived = derivePostType(platform, kinds);
+        expect(MEDIA_TYPE_BY_PLATFORM[platform]).toContain(derived);
+      }
+    }
+  });
+});
+
+describe("composer selection gating", () => {
+  it("lets Instagram take anything", () => {
+    expect(selectionBlocker("INSTAGRAM", ["IMAGE", "VIDEO"])).toBeNull();
+    expect(selectionBlocker("INSTAGRAM", ["IMAGE"])).toBeNull();
+  });
+
+  it("blocks multi-item selections on every single-video platform", () => {
+    for (const platform of ["TIKTOK", "YOUTUBE", "FACEBOOK_PAGE"] as const) {
+      expect(selectionBlocker(platform, ["VIDEO", "VIDEO"])).toMatch(
+        /single video/
+      );
+    }
+  });
+
+  it("blocks a photo on every platform that publishes video only", () => {
+    for (const platform of ["TIKTOK", "YOUTUBE", "FACEBOOK_PAGE"] as const) {
+      expect(selectionBlocker(platform, ["IMAGE"])).toMatch(/not accept photos/);
+    }
+  });
+
+  it("blocks nothing before any file is chosen", () => {
+    for (const platform of [...QUEUED_PLATFORMS, ...NATIVE_PLATFORMS]) {
+      expect(selectionBlocker(platform, [])).toBeNull();
+    }
+  });
+
+  it("allows exactly the selections each platform's post types can hold", () => {
+    // The invariant tying the two functions together: if nothing is blocked,
+    // the derived post type must be able to hold that many files of that kind.
+    for (const platform of [...QUEUED_PLATFORMS, ...NATIVE_PLATFORMS]) {
+      for (const kinds of [["VIDEO"], ["IMAGE"], ["IMAGE", "IMAGE"]] as const) {
+        if (selectionBlocker(platform, kinds)) continue;
+
+        const shape = MEDIA_SHAPE_BY_POST_TYPE[derivePostType(platform, kinds)];
+        expect(kinds.length).toBeGreaterThanOrEqual(shape.minItems);
+        expect(kinds.length).toBeLessThanOrEqual(shape.maxItems);
+        for (const kind of kinds) expect(shape.kinds).toContain(kind);
       }
     }
   });

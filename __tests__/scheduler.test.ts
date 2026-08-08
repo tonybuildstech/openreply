@@ -8,6 +8,7 @@ import {
 } from "../lib/crypto/token-cipher";
 import {
   PLATFORM_CONSTRAINTS,
+  type MediaItemForValidation,
   validateMediaForPlatform,
   validateScheduleWindow,
 } from "../lib/scheduler/constraints";
@@ -258,20 +259,189 @@ describe("schedule window validation", () => {
 });
 
 describe("media validation", () => {
-  it("rejects MOV for Instagram but accepts it for TikTok", () => {
-    const media = { mimeType: "video/quicktime", sizeBytes: 10_000 };
+  const video = (over: Partial<MediaItemForValidation> = {}) => ({
+    mimeType: "video/mp4",
+    sizeBytes: 10_000,
+    kind: "VIDEO" as const,
+    ...over,
+  });
+  const image = (over: Partial<MediaItemForValidation> = {}) => ({
+    mimeType: "image/jpeg",
+    sizeBytes: 10_000,
+    kind: "IMAGE" as const,
+    ...over,
+  });
 
-    expect(validateMediaForPlatform("INSTAGRAM", media)).toMatch(/video\/mp4/);
-    expect(validateMediaForPlatform("TIKTOK", media)).toBeNull();
+  it("rejects MOV for Instagram but accepts it for TikTok", () => {
+    const media = [video({ mimeType: "video/quicktime" })];
+
+    expect(validateMediaForPlatform("INSTAGRAM", "REEL", media)).toMatch(
+      /video\/mp4/
+    );
+    expect(
+      validateMediaForPlatform("TIKTOK", "TIKTOK_VIDEO", media)
+    ).toBeNull();
   });
 
   it("rejects a file over the platform's size ceiling", () => {
-    const issue = validateMediaForPlatform("TIKTOK", {
-      mimeType: "video/mp4",
-      sizeBytes: 5 * 1024 ** 3,
-    });
+    const issue = validateMediaForPlatform("TIKTOK", "TIKTOK_VIDEO", [
+      video({ sizeBytes: 5 * 1024 ** 3 }),
+    ]);
 
     expect(issue).toMatch(/larger than/);
+  });
+
+  it("refuses still images on platforms that only take video", () => {
+    for (const [platform, postType] of [
+      ["TIKTOK", "TIKTOK_VIDEO"],
+      ["YOUTUBE", "SHORT"],
+      ["FACEBOOK_PAGE", "FACEBOOK_REEL"],
+    ] as const) {
+      expect(validateMediaForPlatform(platform, postType, [image()])).not.toBeNull();
+    }
+  });
+
+  it("accepts a JPEG as an Instagram image post", () => {
+    expect(
+      validateMediaForPlatform("INSTAGRAM", "IMAGE", [image()])
+    ).toBeNull();
+  });
+
+  it("rejects PNG for Instagram until the format is confirmed", () => {
+    // Meta publishes no list of accepted image formats. Rejecting here gives a
+    // readable error instead of an opaque container ERROR at publish time.
+    expect(
+      validateMediaForPlatform("INSTAGRAM", "IMAGE", [
+        image({ mimeType: "image/png" }),
+      ])
+    ).toMatch(/image\/jpeg/);
+  });
+
+  it("enforces Instagram's documented 8 MiB image ceiling", () => {
+    expect(
+      validateMediaForPlatform("INSTAGRAM", "IMAGE", [
+        image({ sizeBytes: 9 * 1024 * 1024 }),
+      ])
+    ).toMatch(/8 MB limit/);
+
+    expect(
+      validateMediaForPlatform("INSTAGRAM", "IMAGE", [
+        image({ sizeBytes: 7 * 1024 * 1024 }),
+      ])
+    ).toBeNull();
+  });
+
+  /**
+   * The check that exists because Instagram REJECTS out-of-range stills rather
+   * than cropping them — without it, the failure lands in the worker at the
+   * scheduled minute instead of in the composer.
+   */
+  describe("Instagram still aspect ratio", () => {
+    it("accepts the documented range and its boundaries", () => {
+      for (const [w, h] of [
+        [1080, 1080], // 1:1
+        [1080, 1350], // 4:5, the floor
+        [1910, 1000], // 1.91:1, the ceiling
+      ]) {
+        expect(
+          validateMediaForPlatform("INSTAGRAM", "IMAGE", [
+            image({ widthPx: w, heightPx: h }),
+          ])
+        ).toBeNull();
+      }
+    });
+
+    it("rejects a too-tall 9:16 still and names the ratio", () => {
+      const issue = validateMediaForPlatform("INSTAGRAM", "IMAGE", [
+        image({ widthPx: 1080, heightPx: 1920 }),
+      ]);
+
+      expect(issue).toMatch(/9:16/);
+      expect(issue).toMatch(/4:5 to 1\.91:1/);
+    });
+
+    it("accepts 16:9, which sits just inside the 1.91 ceiling", () => {
+      // 1.778 < 1.91. Worth pinning: it is the most common landscape format and
+      // an over-eager range check would reject it.
+      expect(
+        validateMediaForPlatform("INSTAGRAM", "IMAGE", [
+          image({ widthPx: 1920, heightPx: 1080 }),
+        ])
+      ).toBeNull();
+    });
+
+    it("rejects a genuinely too-wide 2:1 still", () => {
+      const issue = validateMediaForPlatform("INSTAGRAM", "IMAGE", [
+        image({ widthPx: 2000, heightPx: 1000 }),
+      ]);
+
+      expect(issue).toMatch(/2000×1000/);
+      expect(issue).toMatch(/4:5 to 1\.91:1/);
+    });
+
+    it("says nothing when the browser could not probe dimensions", () => {
+      // Unknown is not invalid. Refusing here would block every upload from a
+      // browser where the probe failed.
+      expect(
+        validateMediaForPlatform("INSTAGRAM", "IMAGE", [
+          image({ widthPx: null, heightPx: null }),
+        ])
+      ).toBeNull();
+    });
+
+    it("ignores ratio for video, which Instagram does not reject the same way", () => {
+      expect(
+        validateMediaForPlatform("INSTAGRAM", "REEL", [
+          video({ widthPx: 1080, heightPx: 1920 }),
+        ])
+      ).toBeNull();
+    });
+  });
+
+  describe("item counts per post type", () => {
+    it("accepts a 2–10 item Instagram carousel", () => {
+      for (const count of [2, 5, 10]) {
+        const items = Array.from({ length: count }, () => image());
+        expect(
+          validateMediaForPlatform("INSTAGRAM", "CAROUSEL", items)
+        ).toBeNull();
+      }
+    });
+
+    it("rejects a carousel outside 2–10", () => {
+      expect(
+        validateMediaForPlatform("INSTAGRAM", "CAROUSEL", [image()])
+      ).toMatch(/between 2 and 10 files/);
+
+      const eleven = Array.from({ length: 11 }, () => image());
+      expect(
+        validateMediaForPlatform("INSTAGRAM", "CAROUSEL", eleven)
+      ).toMatch(/between 2 and 10 files/);
+    });
+
+    it("allows a carousel to mix images and video", () => {
+      expect(
+        validateMediaForPlatform("INSTAGRAM", "CAROUSEL", [image(), video()])
+      ).toBeNull();
+    });
+
+    it("rejects more than one file on any single-file post type", () => {
+      expect(
+        validateMediaForPlatform("INSTAGRAM", "REEL", [video(), video()])
+      ).toMatch(/exactly 1 file/);
+      expect(
+        validateMediaForPlatform("TIKTOK", "TIKTOK_VIDEO", [video(), video()])
+      ).toMatch(/exactly 1 file/);
+    });
+
+    it("names which item is at fault in a carousel", () => {
+      const issue = validateMediaForPlatform("INSTAGRAM", "CAROUSEL", [
+        image(),
+        image({ mimeType: "image/png" }),
+      ]);
+
+      expect(issue).toMatch(/^Item 2: /);
+    });
   });
 
   it("documents a daily cap for every platform that publishes one", () => {

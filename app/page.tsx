@@ -7,7 +7,7 @@ import Link from "next/link";
 export const metadata: Metadata = {
   title: "OpenReply - Instagram comment-to-DM automation and video scheduling",
   description:
-    "OpenReply is a free, self-hosted social media tool. It sends an automatic Instagram DM when someone comments your keyword on a post or reel, and schedules your videos to Instagram, TikTok, YouTube and Facebook Pages using the official APIs.",
+    "OpenReply is a free social media tool. It sends an automatic Instagram DM when someone comments your keyword on a post or reel, and schedules your videos to Instagram, TikTok, YouTube and Facebook Pages using the official APIs.",
 };
 
 const GITHUB_URL = "https://github.com/diwenne/openreply";
@@ -76,7 +76,6 @@ const features = [
   "Per-account rate limiting",
   "Tracked links with click stats",
   "DM logs with full status",
-  "No plan limits, fully self-hosted",
 ];
 
 /* Static, faithful copies of the real Overview and Dashboard screens, built in
@@ -340,7 +339,7 @@ export default async function Home() {
 
           <p className="mt-6 max-w-2xl text-lg leading-8 text-zinc-300">
             <strong className="font-semibold text-white">{APP_NAME}</strong> is a
-            free, open-source, self-hosted social media management application
+            free, open-source social media management application
             for businesses and creators. It does two things. First, it sends an
             automatic Instagram direct message to anyone who comments a keyword
             you chose on one of your own posts or reels. Second, it schedules
@@ -550,7 +549,7 @@ export default async function Home() {
             Everything, no tiers
           </h2>
           <p className="mt-5 text-base leading-8 text-zinc-400">
-            It is self-hosted and open source, so there is nothing to unlock. You
+            It is open source, so there is nothing to unlock. You
             run it, you own it.
           </p>
         </div>

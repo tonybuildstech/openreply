@@ -158,11 +158,10 @@ export default function EditScheduledPostPage() {
           : {}),
         ...(can("mediaType") ? { mediaType } : {}),
         ...(can("platformOptions") ? { platformOptions: options } : {}),
+        // Replaces the whole ordered set. This page edits single-media posts
+        // only; a carousel warns above that swapping replaces every item.
         ...(can("media") && newMedia
-          ? {
-              mediaStorageKey: newMedia.mediaStorageKey,
-              mediaMimeType: newMedia.mimeType,
-            }
+          ? { media: [{ storageKey: newMedia.mediaStorageKey }] }
           : {}),
       }),
     });

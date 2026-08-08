@@ -17,7 +17,10 @@ import {
   rejectedFields,
   type EditableField,
 } from "@/lib/scheduler/editing";
-import { MEDIA_TYPE_BY_PLATFORM } from "@/lib/scheduler/types";
+import {
+  MEDIA_TYPE_BY_PLATFORM,
+  SCHEDULED_POST_TYPES,
+} from "@/lib/scheduler/types";
 import { getMediaStorage, mediaKindFor } from "@/lib/storage";
 import {
   canManageWorkspace,
@@ -28,31 +31,28 @@ export const dynamic = "force-dynamic";
 
 const actionSchema = z.object({ action: z.enum(["retry", "cancel"]) });
 
-const patchSchema = z
-  .object({
-    caption: z.string().max(5000).optional(),
-    scheduledAt: z.string().datetime().optional(),
-    mediaType: z
-      .enum([
-        "REEL",
-        "SHORT",
-        "TIKTOK_VIDEO",
-        "FACEBOOK_REEL",
-        "FACEBOOK_VIDEO",
-      ])
-      .optional(),
-    platformOptions: z.record(z.string(), z.unknown()).optional(),
-    // Swapping the file requires a fresh upload first; the client sends the new
-    // key from /api/media/upload.
-    mediaStorageKey: z.string().min(1).optional(),
-    mediaMimeType: z.string().min(1).optional(),
-  })
-  // Both media fields travel together or the record would describe one file
-  // with another's MIME type.
-  .refine(
-    (d) => Boolean(d.mediaStorageKey) === Boolean(d.mediaMimeType),
-    "mediaStorageKey and mediaMimeType must be sent together"
-  );
+/** Same contract as the create route — see the note on `mediaItemSchema` there. */
+const mediaItemSchema = z.object({
+  storageKey: z.string().min(1),
+  widthPx: z.number().int().positive().optional(),
+  heightPx: z.number().int().positive().optional(),
+  durationMs: z.number().int().nonnegative().optional(),
+  croppedToRatio: z.string().max(16).optional(),
+});
+
+const patchSchema = z.object({
+  caption: z.string().max(5000).optional(),
+  scheduledAt: z.string().datetime().optional(),
+  mediaType: z.enum(SCHEDULED_POST_TYPES).optional(),
+  platformOptions: z.record(z.string(), z.unknown()).optional(),
+  /**
+   * Replaces the WHOLE ordered set, not a single item. Swapping files requires
+   * a fresh upload first; the client sends the new keys from /api/media/upload.
+   * Partial edits are not offered on purpose — positions must stay contiguous,
+   * and "replace everything" is the only operation that cannot leave a gap.
+   */
+  media: z.array(mediaItemSchema).min(1).max(10).optional(),
+});
 
 interface NewMediaItem {
   position: number;
@@ -60,6 +60,10 @@ interface NewMediaItem {
   mimeType: string;
   sizeBytes: bigint;
   kind: ScheduledPostMediaKind;
+  widthPx: number | null;
+  heightPx: number | null;
+  durationMs: number | null;
+  croppedToRatio: string | null;
 }
 
 /** BigInt does not survive JSON.stringify, and every item carries one. */
@@ -220,7 +224,7 @@ export async function PATCH(
   if (body.scheduledAt !== undefined) requested.push("scheduledAt");
   if (body.platformOptions !== undefined) requested.push("platformOptions");
   if (body.mediaType !== undefined) requested.push("mediaType");
-  if (body.mediaStorageKey !== undefined) requested.push("media");
+  if (body.media !== undefined) requested.push("media");
 
   const rejected = rejectedFields(policy, requested);
   if (rejected.length > 0) {
@@ -255,35 +259,62 @@ export async function PATCH(
     );
   }
 
-  // New file: trust storage for the real size and kind, not the client.
-  let replacementMedia: NewMediaItem | null = null;
-  if (body.mediaStorageKey && body.mediaMimeType) {
-    try {
-      const stat = await getMediaStorage().stat(body.mediaStorageKey);
-      replacementMedia = {
-        position: 0,
-        storageKey: body.mediaStorageKey,
-        mimeType: body.mediaMimeType,
+  // New files: trust storage for size, MIME type and kind, never the client.
+  let replacementMedia: NewMediaItem[] | null = null;
+  if (body.media) {
+    const storage = getMediaStorage();
+    const items: NewMediaItem[] = [];
+
+    for (const [index, item] of body.media.entries()) {
+      let stat: { size: number; contentType: string };
+      try {
+        stat = await storage.stat(item.storageKey);
+      } catch {
+        return NextResponse.json(
+          {
+            success: false,
+            error:
+              body.media.length > 1
+                ? `Item ${index + 1} was not found in storage — upload it again`
+                : "Uploaded media not found — upload it again",
+          },
+          { status: 400 }
+        );
+      }
+
+      items.push({
+        // Array order, not a client-supplied position.
+        position: index,
+        storageKey: item.storageKey,
+        mimeType: stat.contentType,
         sizeBytes: BigInt(stat.size),
-        kind: mediaKindFor(body.mediaMimeType),
-      };
-    } catch {
-      return NextResponse.json(
-        { success: false, error: "Uploaded media not found — upload it again" },
-        { status: 400 }
-      );
+        kind: mediaKindFor(stat.contentType),
+        widthPx: item.widthPx ?? null,
+        heightPx: item.heightPx ?? null,
+        durationMs: item.durationMs ?? null,
+        croppedToRatio: item.croppedToRatio ?? null,
+      });
     }
 
-    const mediaIssue = validateMediaForPlatform(platform, {
-      mimeType: replacementMedia.mimeType,
-      sizeBytes: Number(replacementMedia.sizeBytes),
-    });
+    const mediaIssue = validateMediaForPlatform(
+      platform,
+      mediaType,
+      items.map((item) => ({
+        mimeType: item.mimeType,
+        sizeBytes: Number(item.sizeBytes),
+        kind: item.kind,
+        widthPx: item.widthPx,
+        heightPx: item.heightPx,
+      }))
+    );
     if (mediaIssue) {
       return NextResponse.json(
         { success: false, error: mediaIssue },
         { status: 400 }
       );
     }
+
+    replacementMedia = items;
   }
 
   const updates = {
@@ -318,7 +349,10 @@ export async function PATCH(
           ...post,
           ...updates,
           media: replacementMedia
-            ? [{ ...post.media[0], ...replacementMedia }]
+            ? replacementMedia.map((item, index) => ({
+                ...post.media[index],
+                ...item,
+              }))
             : post.media,
         },
         post.connectedAccount
@@ -348,7 +382,7 @@ export async function PATCH(
       // rows in place: positions must stay contiguous, and deleteMany +
       // create inside one update is atomic.
       ...(replacementMedia
-        ? { media: { deleteMany: {}, create: [replacementMedia] } }
+        ? { media: { deleteMany: {}, create: replacementMedia } }
         : {}),
     },
     include: { media: { orderBy: { position: "asc" } } },

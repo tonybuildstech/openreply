@@ -72,6 +72,40 @@ export function createPublishWorker(): Worker<PublishPostJob> {
  * that catches ones created while the worker was down. The job ID is derived
  * from the post ID, so neither path can enqueue the same post twice.
  */
+async function enqueueOne(
+  queue: ReturnType<typeof getPublishQueue>,
+  postId: string
+): Promise<boolean> {
+  const jobId = `publish_${postId}`;
+  const existing = await queue.getJob(jobId);
+
+  if (existing) {
+    const state = await existing.getState();
+
+    // A live job already owns this post — waiting, running, or backing off
+    // between attempts. Leaving it alone is the whole point of the stable job
+    // ID: two jobs for one post would publish the same video twice.
+    if (
+      state === "waiting" ||
+      state === "waiting-children" ||
+      state === "prioritized" ||
+      state === "active" ||
+      state === "delayed"
+    ) {
+      return false;
+    }
+
+    // Terminal, but the post is QUEUED again — it was edited or retried. The
+    // old job is kept for a week by `removeOnFail`, and BullMQ silently ignores
+    // an add() that reuses an existing ID, so without this removal the poll
+    // would report "enqueued" every minute and never run anything again.
+    await existing.remove().catch(() => {});
+  }
+
+  await queue.add("publish-post", { scheduledPostId: postId }, { jobId });
+  return true;
+}
+
 export async function enqueueDuePosts(): Promise<number> {
   const due = await prisma.scheduledPost.findMany({
     where: {
@@ -97,18 +131,24 @@ export async function enqueueDuePosts(): Promise<number> {
   if (due.length === 0) return 0;
 
   const queue = getPublishQueue();
-  await Promise.all(
-    due.map((post) =>
-      queue.add(
-        "publish-post",
-        { scheduledPostId: post.id },
-        { jobId: `publish_${post.id}` }
-      )
-    )
+  const results = await Promise.all(
+    due.map((post) => enqueueOne(queue, post.id))
   );
+  const enqueued = results.filter(Boolean).length;
 
-  console.log(`[Publish Poll] Enqueued ${due.length} due post(s)`);
-  return due.length;
+  // Count real enqueues, not rows found. The old version logged the row count,
+  // so a wedged job looked exactly like healthy work: "Enqueued 1 due post(s)"
+  // once a minute, forever, with nothing ever processing.
+  if (enqueued > 0) {
+    console.log(`[Publish Poll] Enqueued ${enqueued} due post(s)`);
+  }
+  if (enqueued < due.length) {
+    console.log(
+      `[Publish Poll] ${due.length - enqueued} due post(s) already have a job in flight`
+    );
+  }
+
+  return enqueued;
 }
 
 /**

@@ -145,6 +145,24 @@ export class PublishError extends Error {
   }
 }
 
+/**
+ * Every post type, as a tuple both scheduler routes build their zod enum from.
+ *
+ * Listed once on purpose. When this was spelled out by hand in the create route
+ * and again in the patch route, widening one and forgetting the other produced
+ * an API that accepted a post type on create and refused it on edit — with a
+ * validation error naming a type the same API had just written.
+ */
+export const SCHEDULED_POST_TYPES = [
+  "REEL",
+  "IMAGE",
+  "CAROUSEL",
+  "SHORT",
+  "TIKTOK_VIDEO",
+  "FACEBOOK_REEL",
+  "FACEBOOK_VIDEO",
+] as const satisfies ReadonlyArray<ScheduledPost["mediaType"]>;
+
 /** Which post types each platform accepts, for validation at schedule time. */
 export const MEDIA_TYPE_BY_PLATFORM: Record<
   SocialPlatform,

@@ -12,12 +12,12 @@ export const metadata: Metadata = {
   applicationName: "OpenReply",
   title: "OpenReply - Instagram comment-to-DM automation and video scheduling",
   description:
-    "OpenReply is a free, self-hosted social media tool. It sends an automatic Instagram DM when someone comments your keyword on a post or reel, and schedules your videos to Instagram, TikTok, YouTube and Facebook Pages — all through the platforms' official APIs.",
+    "OpenReply is a free social media tool. It sends an automatic Instagram DM when someone comments your keyword on a post or reel, and schedules your videos to Instagram, TikTok, YouTube and Facebook Pages — all through the platforms' official APIs.",
   openGraph: {
     siteName: "OpenReply",
     title: "OpenReply - Instagram comment-to-DM automation and video scheduling",
     description:
-      "Free, self-hosted comment-to-DM automation and multi-platform video scheduling, built on the official Meta, Google and TikTok APIs.",
+      "Free comment-to-DM automation and multi-platform video scheduling, built on the official Meta, Google and TikTok APIs.",
     type: "website",
   },
   keywords: [

@@ -19,9 +19,20 @@ const EXTENSION_BY_MIME: Record<string, string> = {
   "video/mp4": ".mp4",
   "video/quicktime": ".mov",
   "video/webm": ".webm",
+  "image/jpeg": ".jpg",
+  "image/png": ".png",
 };
 
-/** Every platform accepts MP4; MOV and WebM are TikTok-only. */
+/**
+ * What the upload endpoint will store. Deliberately WIDER than what any one
+ * platform accepts — storage is platform-agnostic, and per-platform rules live
+ * in `lib/scheduler/constraints.ts` where they can produce a useful message.
+ *
+ * PNG is stored but currently rejected for Instagram: Meta publishes no list of
+ * accepted image formats, so JPEG is the only one we can defend (see
+ * `imageMimeTypes` there). Storing it anyway means the cropper in step 6 can
+ * convert a PNG to JPEG client-side without a second upload round-trip.
+ */
 export const SUPPORTED_UPLOAD_MIME_TYPES = Object.keys(EXTENSION_BY_MIME);
 
 /**

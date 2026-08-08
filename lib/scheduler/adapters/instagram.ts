@@ -6,13 +6,41 @@
  * Meta's product marketing page applies to other flows). Our worker fires this
  * at the scheduled minute.
  *
- * Flow:
- *   1. POST graph.instagram.com/{v}/{ig-user-id}/media
- *        ?media_type=REELS&video_url=<signed public url>  → container id
- *   2. GET  graph.instagram.com/{v}/{container-id}?fields=status_code
- *        poll until FINISHED — Meta downloads our URL during this window
- *   3. POST graph.instagram.com/{v}/{ig-user-id}/media_publish
- *        creation_id=<container-id>                        → media id
+ * Three post shapes, all ending in the same publish call. Every parameter below
+ * is confirmed against Meta's **Instagram Login** content-publishing guide
+ * (research 2026-08-08) — not the IG User Media reference, which documents the
+ * Facebook Login flow and differs in ways that matter.
+ *
+ *   REEL      POST /{ig-user-id}/media  media_type=REELS  video_url=<signed>
+ *
+ *   IMAGE     POST /{ig-user-id}/media  image_url=<signed>
+ *             NO media_type. `IMAGE` is not a documented value — the feed-image
+ *             example omits the parameter entirely, and the documented set is
+ *             REELS / STORIES / CAROUSEL / VIDEO.
+ *
+ *   CAROUSEL  per item, in position order:
+ *               POST /{ig-user-id}/media  is_carousel_item=true
+ *                 image_url=<signed>                     (IMAGE child)
+ *                 media_type=VIDEO & video_url=<signed>  (VIDEO child)
+ *               children carry NO caption — it belongs on the parent
+ *             then:
+ *               POST /{ig-user-id}/media  media_type=CAROUSEL
+ *                 children=id1,id2,id3   ← comma-separated STRING, not JSON
+ *                 caption=…
+ *
+ * Then for all three:
+ *   GET  /{container-id}?fields=status_code  → poll until FINISHED
+ *   POST /{ig-user-id}/media_publish  creation_id=<container-id>  → media id
+ *
+ * **`children` is a string.** Meta's IG User Media reference calls it
+ * `<ARRAY_OF_CAROUSEL_CONTAINER_IDS>`, which reads like JSON and is not; the
+ * Instagram Login guide's own example is a plain comma-joined string.
+ *
+ * **Video children take `media_type=VIDEO`, never `REELS`.** Meta is explicit
+ * that "reels are not supported" as carousel items.
+ *
+ * **Carousels count as ONE post** against the account's 50-per-24h publishing
+ * limit, however many children they have.
  *
  * **Why `video_url` and not the documented binary upload.** The 2026-08-06
  * research settled on `upload_type=resumable` + a raw-bytes POST to
@@ -30,7 +58,10 @@
  * the messaging scopes this app already holds.
  */
 
-import type { ConnectedAccount } from "@/app/generated/prisma/client";
+import type {
+  ConnectedAccount,
+  ScheduledPostMedia,
+} from "@/app/generated/prisma/client";
 import { getMetaGraphApiVersion } from "@/lib/env";
 import {
   fetchWithTimeout,
@@ -47,10 +78,41 @@ import {
 } from "@/lib/scheduler/types";
 
 const CONTAINER_POLL_INTERVAL_MS = 6_000;
-// Meta documents no processing SLA, and this window now also covers Meta
+
+// Meta documents no processing SLA, and this window also covers Meta
 // downloading the file from us. Ten minutes is our own ceiling: long enough for
 // a 90-second Reel, short enough that a stuck container frees the worker.
-const CONTAINER_POLL_TIMEOUT_MS = 10 * 60_000;
+const SINGLE_CONTAINER_BUDGET_MS = 10 * 60_000;
+
+/**
+ * Budget for a WHOLE carousel — every child plus the parent — not per container.
+ *
+ * Ten videos at ten minutes each would be 100 minutes, against signed media URLs
+ * that expire in two hours (`lib/storage/public-url.ts`) and child containers
+ * that expire 24h from their own creation. A shared deadline keeps the slowest
+ * case bounded instead of letting it creep up on both expiries at once.
+ */
+const CAROUSEL_TOTAL_BUDGET_MS = 20 * 60_000;
+
+/**
+ * What a post's files are, for choosing the error copy when one is rejected.
+ * MIXED covers a carousel of both, where we cannot say which item failed.
+ */
+type MediaKind = "IMAGE" | "VIDEO" | "MIXED";
+
+function mediaKindOf(post: ScheduledPostWithMedia): MediaKind {
+  const kinds = new Set(post.media.map((item) => item.kind));
+  return kinds.size === 1 ? (post.media[0].kind as MediaKind) : "MIXED";
+}
+
+/** Meta's documented ceiling: "up to 10 images, videos, or a mix of the two". */
+const CAROUSEL_MAX_CHILDREN = 10;
+/**
+ * Our floor, not Meta's — the docs state no minimum (see Q14). Two is what the
+ * Instagram app itself requires, and a one-item "carousel" should be an IMAGE
+ * or REEL post instead.
+ */
+const CAROUSEL_MIN_CHILDREN = 2;
 
 function graphBase(): string {
   return `https://graph.instagram.com/${getMetaGraphApiVersion()}`;
@@ -197,35 +259,65 @@ async function assertPublishingHeadroom(
   }
 }
 
-async function createContainer(
-  post: ScheduledPostWithMedia,
-  igUserId: string,
-  accessPlaintextToken: string
-): Promise<string> {
-  const options = (post.platformOptions ?? {}) as InstagramOptions;
-  // Reels are one video. IMAGE and CAROUSEL posts get their own paths in a
-  // follow-up step; until then this adapter still only publishes REEL, and
-  // refuses anything multi-item rather than publishing part of it.
-  const media = requireSingleMedia(post);
-
-  // Thrown before we touch Meta when the deployment has no public HTTPS base
-  // URL — a `localhost` video_url would only surface ten minutes later as an
-  // unexplained container ERROR.
-  let videoUrl: string;
+/**
+ * A publicly fetchable URL for one stored file.
+ *
+ * Called for every item BEFORE any container is created, so a deployment with
+ * no public HTTPS base URL fails immediately instead of leaving half a carousel
+ * of containers behind and surfacing as an unexplained ERROR ten minutes later.
+ */
+function signedUrlFor(storageKey: string): string {
   try {
-    videoUrl = buildSignedMediaUrl(media.storageKey);
+    return buildSignedMediaUrl(storageKey);
   } catch (error) {
     throw new PublishError(
-      error instanceof Error ? error.message : "Cannot build a public video URL",
+      error instanceof Error ? error.message : "Cannot build a public media URL",
       false
     );
   }
+}
+
+/** POST /{ig-user-id}/media, returning the new container's ID. */
+async function createMediaContainer(
+  igUserId: string,
+  params: URLSearchParams,
+  accessPlaintextToken: string,
+  context: string
+): Promise<string> {
+  params.set("access_token", accessPlaintextToken);
+
+  const body = await metaRequest(
+    `${graphBase()}/${igUserId}/media`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params.toString(),
+    },
+    context
+  );
+
+  const containerId = body.id as string | undefined;
+  if (!containerId) {
+    throw new PublishError(`${context}: no container ID returned`, true, {
+      responseSnippet: toResponseSnippet(body),
+    });
+  }
+
+  return containerId;
+}
+
+/** Reels: one video, plus the full option set the composer collects. */
+function reelParams(
+  post: ScheduledPostWithMedia,
+  media: ScheduledPostMedia
+): URLSearchParams {
+  const options = (post.platformOptions ?? {}) as InstagramOptions;
 
   const params = new URLSearchParams({
     media_type: "REELS",
-    video_url: videoUrl,
-    access_token: accessPlaintextToken,
+    video_url: signedUrlFor(media.storageKey),
   });
+
   if (post.caption) params.set("caption", post.caption);
   if (options.shareToFeed !== undefined) {
     params.set("share_to_feed", String(options.shareToFeed));
@@ -244,39 +336,79 @@ async function createContainer(
     if (userTags) params.set("user_tags", userTags);
   }
 
-  const body = await metaRequest(
-    `${graphBase()}/${igUserId}/media`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: params.toString(),
-    },
-    "Instagram container creation"
-  );
+  return params;
+}
 
-  const containerId = body.id as string | undefined;
-  if (!containerId) {
-    throw new PublishError(
-      "Instagram did not return a container ID",
-      true,
-      { responseSnippet: toResponseSnippet(body) }
-    );
+/**
+ * Single feed image.
+ *
+ * Caption only, deliberately. `location_id`, `user_tags` and `collaborators`
+ * are documented for images ONLY against `graph.facebook.com`, and image
+ * `user_tags` are documented as `{username, x, y}` while our composer collects
+ * bare usernames (Q16/Q17). Sending unverified parameters risks a `(#100)` on a
+ * post that would otherwise publish; add them once `.dev/probe-ig-params.ts`
+ * confirms them.
+ */
+function imageParams(
+  post: ScheduledPostWithMedia,
+  media: ScheduledPostMedia
+): URLSearchParams {
+  // No media_type: the documented feed-image example omits it, and `IMAGE` is
+  // not among the accepted values (REELS / STORIES / CAROUSEL / VIDEO).
+  const params = new URLSearchParams({
+    image_url: signedUrlFor(media.storageKey),
+  });
+  if (post.caption) params.set("caption", post.caption);
+  return params;
+}
+
+/** One carousel child. Never carries a caption — that lives on the parent. */
+function carouselChildParams(media: ScheduledPostMedia): URLSearchParams {
+  const params = new URLSearchParams({ is_carousel_item: "true" });
+
+  if (media.kind === "IMAGE") {
+    params.set("image_url", signedUrlFor(media.storageKey));
+  } else {
+    // VIDEO, never REELS — Meta documents that reels are not valid carousel
+    // items, and passing REELS earns "The media type entered is not one of the
+    // expected media types."
+    params.set("media_type", "VIDEO");
+    params.set("video_url", signedUrlFor(media.storageKey));
   }
 
-  return containerId;
+  return params;
+}
+
+/**
+ * Why a container failed, in words the user can act on.
+ *
+ * Instagram reports asset problems as a terminal container ERROR with the real
+ * reason buried in `status`, so the dashboard would otherwise show "could not
+ * process this" for a file that is simply the wrong shape. All permanent:
+ * retrying the same bytes reproduces them exactly.
+ */
+function containerErrorMessage(kind: MediaKind): string {
+  if (kind === "IMAGE") {
+    return "Instagram rejected this image. It must be within a 4:5 to 1.91:1 aspect ratio and under 8 MB, and this server must be reachable for Instagram to download it.";
+  }
+  if (kind === "VIDEO") {
+    return "Instagram could not process this video. Either it does not meet Instagram's requirements (MP4 or MOV), or Instagram could not download it from this server.";
+  }
+  return "Instagram could not process one of these files. Images must be within a 4:5 to 1.91:1 aspect ratio and under 8 MB; videos must be MP4 or MOV. This server must also be reachable for Instagram to download them.";
 }
 
 async function waitForContainer(
   containerId: string,
-  accessPlaintextToken: string
+  accessPlaintextToken: string,
+  deadline: number,
+  label: string,
+  kind: MediaKind = "MIXED"
 ): Promise<void> {
-  const deadline = Date.now() + CONTAINER_POLL_TIMEOUT_MS;
-
   while (Date.now() < deadline) {
     const body = await metaRequest(
       `${graphBase()}/${containerId}?fields=status_code&access_token=${encodeURIComponent(accessPlaintextToken)}`,
       { method: "GET" },
-      "Instagram container status"
+      `Instagram container status (${label})`
     );
 
     const status = body.status_code as string | undefined;
@@ -285,18 +417,31 @@ async function waitForContainer(
 
     if (status === "ERROR") {
       // Documented as terminal. The container cannot be reused; a retry must
-      // start from a fresh container, which is what the worker's retry does.
+      // start from a fresh one, which is what the worker's retry does.
+      throw new PublishError(containerErrorMessage(kind), false, {
+        responseSnippet: toResponseSnippet(body),
+      });
+    }
+
+    if (status === "EXPIRED") {
+      // Containers must be published within 24h of creation. Retryable, because
+      // a fresh attempt builds a new container from scratch.
       throw new PublishError(
-        "Instagram could not process this video. Either it does not meet Reels requirements (MP4, 3–90s, vertical), or Instagram could not download it from this server.",
-        false,
+        `Instagram expired this container before it could be published (${label})`,
+        true,
         { responseSnippet: toResponseSnippet(body) }
       );
     }
 
-    // Only IN_PROGRESS / FINISHED / ERROR are documented. Anything else (an
-    // EXPIRED, say) is treated as terminal-unknown rather than assumed
-    // recoverable — silently retrying a stale container is exactly the failure
-    // mode the brief warned about.
+    if (status === "PUBLISHED") {
+      // Already live. Returning rather than throwing avoids publishing a second
+      // copy on a retry that raced an earlier success.
+      return;
+    }
+
+    // IN_PROGRESS is the only remaining documented value. Anything else is
+    // terminal-unknown rather than assumed recoverable: silently retrying a
+    // stale container is exactly the failure mode to avoid.
     if (status && status !== "IN_PROGRESS") {
       throw new PublishError(
         `Instagram returned an unexpected container status: ${status}`,
@@ -311,8 +456,157 @@ async function waitForContainer(
   }
 
   throw new PublishError(
-    "Instagram is still processing this video after 10 minutes",
+    `Instagram is still processing this post (${label}) — gave up waiting`,
     true
+  );
+}
+
+/**
+ * Build and prepare a carousel, returning the parent container ID.
+ *
+ * **Order is the contract.** `post.media` arrives sorted by `position` (see the
+ * include in `lib/scheduler/dispatch.ts`) and Instagram renders children in the
+ * order they appear in `children`, so this must never reorder them or fan out
+ * into an unordered collection.
+ *
+ * **No cleanup on partial failure.** If child 7 of 10 fails, six containers are
+ * left dangling. They expire on their own within 24h and cost nothing, and Meta
+ * documents no delete. What matters is that a retry builds FRESH children —
+ * these IDs are locals and are never persisted, so a retry cannot reuse them.
+ * Do not "optimise" that into a cache.
+ */
+async function createCarouselContainer(
+  post: ScheduledPostWithMedia,
+  igUserId: string,
+  accessPlaintextToken: string,
+  deadline: number
+): Promise<string> {
+  const items = post.media;
+
+  // The API and composer both check this first; this is the backstop, and it
+  // runs before any container is created so a bad post costs no API calls.
+  if (
+    items.length < CAROUSEL_MIN_CHILDREN ||
+    items.length > CAROUSEL_MAX_CHILDREN
+  ) {
+    throw new PublishError(
+      `An Instagram carousel needs between ${CAROUSEL_MIN_CHILDREN} and ${CAROUSEL_MAX_CHILDREN} items — this post has ${items.length}`,
+      false
+    );
+  }
+
+  const childIds: string[] = [];
+  for (const [index, media] of items.entries()) {
+    const childId = await createMediaContainer(
+      igUserId,
+      carouselChildParams(media),
+      accessPlaintextToken,
+      `Instagram carousel item ${index + 1} of ${items.length}`
+    );
+
+    // Images are fetched during creation and normally come back FINISHED at
+    // once; videos genuinely process. Polling both keeps one rule, and an
+    // already-finished container costs a single extra GET.
+    await waitForContainer(
+      childId,
+      accessPlaintextToken,
+      deadline,
+      `item ${index + 1} of ${items.length}`,
+      media.kind
+    );
+
+    childIds.push(childId);
+  }
+
+  const params = new URLSearchParams({
+    media_type: "CAROUSEL",
+    // A comma-joined STRING. Meta's reference calls this
+    // <ARRAY_OF_CAROUSEL_CONTAINER_IDS>, which is misleading — it is not JSON.
+    children: childIds.join(","),
+  });
+  if (post.caption) params.set("caption", post.caption);
+
+  return createMediaContainer(
+    igUserId,
+    params,
+    accessPlaintextToken,
+    "Instagram carousel container"
+  );
+}
+
+/**
+ * Create the container for whichever post shape this is, and wait for it to be
+ * ready to publish.
+ */
+async function prepareContainer(
+  post: ScheduledPostWithMedia,
+  igUserId: string,
+  accessPlaintextToken: string
+): Promise<string> {
+  if (post.mediaType === "CAROUSEL") {
+    // One budget for every child AND the parent, not one per container.
+    const deadline = Date.now() + CAROUSEL_TOTAL_BUDGET_MS;
+    const containerId = await createCarouselContainer(
+      post,
+      igUserId,
+      accessPlaintextToken,
+      deadline
+    );
+    await waitForContainer(
+      containerId,
+      accessPlaintextToken,
+      deadline,
+      "carousel",
+      mediaKindOf(post)
+    );
+    return containerId;
+  }
+
+  // REEL and IMAGE are both exactly one file.
+  const media = requireSingleMedia(post);
+  const deadline = Date.now() + SINGLE_CONTAINER_BUDGET_MS;
+
+  if (post.mediaType === "IMAGE") {
+    const containerId = await createMediaContainer(
+      igUserId,
+      imageParams(post, media),
+      accessPlaintextToken,
+      "Instagram image container"
+    );
+    await waitForContainer(
+      containerId,
+      accessPlaintextToken,
+      deadline,
+      "image",
+      "IMAGE"
+    );
+    return containerId;
+  }
+
+  if (post.mediaType === "REEL") {
+    const containerId = await createMediaContainer(
+      igUserId,
+      reelParams(post, media),
+      accessPlaintextToken,
+      "Instagram Reel container"
+    );
+    await waitForContainer(
+      containerId,
+      accessPlaintextToken,
+      deadline,
+      "reel",
+      "VIDEO"
+    );
+    return containerId;
+  }
+
+  // Reachable only if MEDIA_TYPE_BY_PLATFORM gains an Instagram post type that
+  // this adapter has no path for. Failing loudly beats publishing the wrong
+  // shape — which is exactly what happened when IMAGE and CAROUSEL were added
+  // to that map before these branches existed.
+  throw new PublishError(
+    `Instagram cannot publish a ${post.mediaType} post`,
+    false
   );
 }
 
@@ -324,14 +618,15 @@ export const instagramAdapter: PublishAdapter = {
     const accessPlaintextToken = await resolveAccessToken(account);
     const igUserId = account.platformAccountId;
 
+    // A carousel counts as ONE published item however many children it has, so
+    // the headroom check is the same for all three shapes.
     await assertPublishingHeadroom(igUserId, accessPlaintextToken);
 
-    const containerId = await createContainer(
+    const containerId = await prepareContainer(
       post,
       igUserId,
       accessPlaintextToken
     );
-    await waitForContainer(containerId, accessPlaintextToken);
 
     const published = await metaRequest(
       `${graphBase()}/${igUserId}/media_publish`,

@@ -235,9 +235,6 @@ export default function SettingsPage() {
             <p className="text-sm font-medium text-foreground">
               DMs sent this month
             </p>
-            <p className="text-xs text-muted mt-0.5">
-              Self-hosted — no plan limits.
-            </p>
           </div>
           <span className="text-sm font-semibold text-foreground">
             {data?.workspace.dmsSentThisPeriod ?? 0}

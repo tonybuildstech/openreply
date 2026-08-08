@@ -1,45 +1,77 @@
 "use client";
 
 /**
- * Composer — upload one video, schedule it to any number of accounts.
+ * Composer — upload one or more files, schedule them to any number of accounts.
  *
  * Validation happens at selection time against each platform's real limits.
- * The rule from the brief holds: warn or refuse, never silently re-encode.
- * Nothing in OpenReply touches the file.
+ * The rule from the brief still holds, with one deliberate exception: warn or
+ * refuse, never *silently* re-encode. Cropping a photo does re-encode it, and
+ * only ever after an explicit click — the "Original" default uploads the bytes
+ * as they were.
+ *
+ * The exception exists because Instagram REJECTS stills outside 4:5–1.91:1
+ * rather than cropping them, so for an out-of-range photo a crop is the only
+ * route to publishing at all. Refusing to submit until it is resolved is what
+ * keeps that failure here, in front of the user, instead of in the worker at
+ * the scheduled minute.
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import PlatformLogo, {
   AccountAvatar,
 } from "@/components/scheduler/platform-logo";
 import PlatformOptions from "@/components/scheduler/platform-options";
+import MediaTray, {
+  itemBlocker,
+  type TrayItem,
+} from "@/components/scheduler/media-tray";
 import {
   PLATFORM_META,
   PLATFORM_ORDER,
+  derivePostType,
+  selectionBlocker,
   type PlatformKey,
 } from "@/components/scheduler/platform-meta";
+import { cropImageToRatio } from "@/lib/media/crop-image";
+import { probeMedia } from "@/lib/media/probe";
+import type { AspectPreset } from "@/lib/media/aspect";
 import type {
   ComposerAccount,
   ComposerTarget,
   TargetOptions,
 } from "@/components/scheduler/types";
 
-interface UploadedMedia {
-  mediaStorageKey: string;
-  mimeType: string;
-  sizeBytes: number;
-  filename: string | null;
+/**
+ * One picked file, from selection through to submission.
+ *
+ * `file` is the ORIGINAL the user chose and is kept for the whole session: a
+ * ratio change re-crops from it, so switching 4:5 → 1:1 → 4:5 never compounds
+ * JPEG loss the way re-cropping the previous crop would.
+ */
+interface ComposerMediaItem extends TrayItem {
+  file: File;
+  /** Null while the upload is in flight. */
+  storageKey: string | null;
+  /** Set once a crop has been applied, e.g. "4:5". */
+  croppedToRatio: string | null;
 }
 
 interface PlatformConstraint {
-  mimeTypes: string[];
+  videoMimeTypes: string[];
+  imageMimeTypes: string[];
   maxFileBytes?: number;
+  maxImageBytes?: number;
+  imageAspectRatioRange?: { min: number; max: number };
+  carousel?: { minItems: number; maxItems: number; allowsVideo: boolean };
   minLeadTimeMinutes: number;
   maxLeadTimeDays: number;
   notes: string[];
 }
+
+/** Instagram's carousel ceiling, and the most any platform accepts. */
+const MAX_ITEMS = 10;
 
 /** Datetime-local wants local wall time, not an ISO instant. */
 function toLocalInputValue(date: Date): string {
@@ -72,7 +104,7 @@ export default function ComposePage() {
   const [constraints, setConstraints] = useState<
     Record<string, PlatformConstraint>
   >({});
-  const [media, setMedia] = useState<UploadedMedia | null>(null);
+  const [media, setMedia] = useState<ComposerMediaItem[]>([]);
   const [uploading, setUploading] = useState(false);
   const [caption, setCaption] = useState("");
   const [scheduledAt, setScheduledAt] = useState(() =>
@@ -90,6 +122,29 @@ export default function ComposePage() {
   // warnings genuinely depend on "now", and re-ticking keeps a composer left
   // open for an hour from showing a stale verdict.
   const [now, setNow] = useState<number | null>(null);
+
+  const accountById = useMemo(
+    () => new Map(accounts.map((a) => [a.id, a])),
+    [accounts]
+  );
+
+  /** Kinds in carousel order — what every post-type decision keys off. */
+  const mediaKinds = useMemo(
+    () => media.map((item) => item.kind),
+    [media]
+  );
+
+  const instagramRange = constraints.INSTAGRAM?.imageAspectRatioRange;
+
+  /** Items Instagram would reject outright until they are cropped. */
+  const blockedItems = useMemo(
+    () =>
+      media
+        .map((item) => itemBlocker(item, instagramRange))
+        .filter((blocker): blocker is string => blocker !== null),
+    [media, instagramRange]
+  );
+
 
   useEffect(() => {
     const tick = () => setNow(Date.now());
@@ -115,51 +170,218 @@ export default function ComposePage() {
     return () => window.clearTimeout(timer);
   }, []);
 
-  async function upload(file: File) {
+  // Object URLs are revoked when an item is removed and on unmount. Without
+  // this a ten-photo session pins every original in memory for the life of the
+  // page. Read through a ref so the cleanup sees the final list without
+  // re-running (and revoking a live URL) on every change.
+  const mediaRef = useRef<ComposerMediaItem[]>([]);
+  useEffect(() => {
+    mediaRef.current = media;
+  }, [media]);
+  useEffect(() => {
+    return () => {
+      for (const item of mediaRef.current) URL.revokeObjectURL(item.previewUrl);
+    };
+  }, []);
+
+  /**
+   * Send bytes to storage and return the key.
+   *
+   * Sent as a raw stream, not multipart: the server pipes it straight to disk
+   * and never buffers the whole file.
+   */
+  async function uploadBlob(
+    body: Blob,
+    contentType: string,
+    filename: string
+  ): Promise<{ storageKey: string; sizeBytes: number }> {
+    const res = await fetch("/api/media/upload", {
+      method: "POST",
+      headers: {
+        "Content-Type": contentType,
+        "x-filename": encodeURIComponent(filename),
+      },
+      body,
+    });
+    const payload = await res.json();
+    if (!payload.success) throw new Error(payload.error ?? "Upload failed");
+
+    return {
+      storageKey: payload.data.mediaStorageKey,
+      sizeBytes: payload.data.sizeBytes,
+    };
+  }
+
+  function patchItem(id: string, patch: Partial<ComposerMediaItem>) {
+    setMedia((current) =>
+      current.map((item) => (item.id === id ? { ...item, ...patch } : item))
+    );
+  }
+
+  /** Probe, then upload, each picked file — appended in the order chosen. */
+  async function addFiles(files: File[]) {
+    const room = MAX_ITEMS - media.length;
+    if (room <= 0) return;
+
+    const accepted = files.slice(0, room);
+    if (accepted.length < files.length) {
+      setError(`Instagram allows at most ${MAX_ITEMS} items in one post.`);
+    }
+
+    const staged: ComposerMediaItem[] = accepted.map((file) => ({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+      file,
+      previewUrl: URL.createObjectURL(file),
+      filename: file.name,
+      mimeType: file.type,
+      sizeBytes: file.size,
+      kind: file.type.startsWith("image/") ? "IMAGE" : "VIDEO",
+      widthPx: null,
+      heightPx: null,
+      storageKey: null,
+      ratioId: "ORIGINAL",
+      croppedToRatio: null,
+      uploading: true,
+      error: null,
+    }));
+
+    setMedia((current) => [...current, ...staged]);
     setUploading(true);
-    setError(null);
-    try {
-      // Sent as a raw stream, not multipart: the server pipes it straight to
-      // disk and never buffers the whole video.
-      const res = await fetch("/api/media/upload", {
-        method: "POST",
-        headers: {
-          "Content-Type": file.type,
-          "x-filename": encodeURIComponent(file.name),
-        },
-        body: file,
+
+    for (const item of staged) {
+      // Probed before upload so the tray can warn about ratio immediately,
+      // rather than after a long transfer.
+      const probe = await probeMedia(item.file);
+      patchItem(item.id, {
+        widthPx: probe.widthPx,
+        heightPx: probe.heightPx,
       });
-      const payload = await res.json();
-      if (!payload.success) {
-        setError(payload.error ?? "Upload failed");
+
+      try {
+        const { storageKey, sizeBytes } = await uploadBlob(
+          item.file,
+          item.file.type,
+          item.file.name
+        );
+        patchItem(item.id, { storageKey, sizeBytes, uploading: false });
+      } catch (uploadError) {
+        patchItem(item.id, {
+          uploading: false,
+          error:
+            uploadError instanceof Error
+              ? uploadError.message
+              : "Upload failed",
+        });
+      }
+    }
+
+    setUploading(false);
+  }
+
+  /**
+   * Apply (or undo) a crop.
+   *
+   * Re-crops from the ORIGINAL file every time, then uploads the result as a
+   * new object. The previously uploaded key is left behind: nothing references
+   * it, so it is never published, and the existing "Replace" flow already
+   * orphans files the same way. Cleaning it up would mean a delete endpoint
+   * that accepts a key from the client, which is a worse trade.
+   */
+  async function applyRatio(id: string, preset: AspectPreset) {
+    const item = media.find((entry) => entry.id === id);
+    if (!item || item.kind !== "IMAGE") return;
+
+    patchItem(id, { ratioId: preset.id, uploading: true, error: null });
+
+    try {
+      if (preset.ratio === null) {
+        // Back to the untouched original — the no-re-encode path.
+        const { storageKey, sizeBytes } = await uploadBlob(
+          item.file,
+          item.file.type,
+          item.file.name
+        );
+        patchItem(id, {
+          storageKey,
+          sizeBytes,
+          croppedToRatio: null,
+          widthPx: item.widthPx,
+          heightPx: item.heightPx,
+          uploading: false,
+        });
         return;
       }
-      setMedia(payload.data);
-    } catch {
-      setError("Upload failed. Check your connection and try again.");
-    } finally {
-      setUploading(false);
+
+      const cropped = await cropImageToRatio(
+        item.file,
+        preset.ratio,
+        preset.label
+      );
+      const { storageKey, sizeBytes } = await uploadBlob(
+        cropped.blob,
+        "image/jpeg",
+        item.file.name.replace(/\.[^.]+$/, "") + ".jpg"
+      );
+
+      patchItem(id, {
+        storageKey,
+        sizeBytes,
+        widthPx: cropped.widthPx,
+        heightPx: cropped.heightPx,
+        croppedToRatio: preset.id,
+        uploading: false,
+      });
+    } catch (cropError) {
+      patchItem(id, {
+        ratioId: "ORIGINAL",
+        uploading: false,
+        error:
+          cropError instanceof Error ? cropError.message : "Could not crop this image",
+      });
     }
   }
 
-  const toggleTarget = useCallback((account: ComposerAccount) => {
-    setTargets((current) => {
-      const existing = current.find((t) => t.connectedAccountId === account.id);
-      if (existing) {
-        return current.filter((t) => t.connectedAccountId !== account.id);
-      }
-      return [
-        ...current,
-        {
-          connectedAccountId: account.id,
-          mediaType: PLATFORM_META[account.platform].mediaTypes[0].value,
-          caption: "",
-          options: {},
-        },
-      ];
+  function removeItem(id: string) {
+    setMedia((current) => {
+      const target = current.find((item) => item.id === id);
+      if (target) URL.revokeObjectURL(target.previewUrl);
+      return current.filter((item) => item.id !== id);
     });
-    setExpanded((current) => (current === account.id ? null : account.id));
-  }, []);
+  }
+
+  function reorder(fromIndex: number, toIndex: number) {
+    setMedia((current) => {
+      if (toIndex < 0 || toIndex >= current.length) return current;
+      const next = [...current];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      return next;
+    });
+  }
+
+  const toggleTarget = useCallback(
+    (account: ComposerAccount) => {
+      setTargets((current) => {
+        const existing = current.find(
+          (t) => t.connectedAccountId === account.id
+        );
+        if (existing) {
+          return current.filter((t) => t.connectedAccountId !== account.id);
+        }
+        return [
+          ...current,
+          {
+            connectedAccountId: account.id,
+            mediaType: derivePostType(account.platform, mediaKinds),
+            caption: "",
+            options: {},
+          },
+        ];
+      });
+      setExpanded((current) => (current === account.id ? null : account.id));
+    },
+    [mediaKinds]
+  );
 
   function updateTarget(id: string, patch: Partial<ComposerTarget>) {
     setTargets((current) =>
@@ -177,18 +399,13 @@ export default function ComposePage() {
     );
   }
 
-  const accountById = useMemo(
-    () => new Map(accounts.map((a) => [a.id, a])),
-    [accounts]
-  );
-
   /**
    * Client-side warnings for the platforms actually selected. The API
    * re-validates everything — this exists so the user finds out before
    * submitting, not after.
    */
   const warnings = useMemo(() => {
-    if (!media || targets.length === 0 || now === null) return [];
+    if (media.length === 0 || targets.length === 0 || now === null) return [];
     const when = new Date(scheduledAt);
     const minutesAhead = (when.getTime() - now) / 60_000;
     const seen = new Set<string>();
@@ -207,18 +424,34 @@ export default function ComposePage() {
         list.push(message);
       };
 
-      if (!constraint.mimeTypes.includes(media.mimeType)) {
-        push(
-          `${label}-mime`,
-          `${label} does not accept ${media.mimeType} — it needs ${constraint.mimeTypes.join(" or ")}.`
-        );
-      }
+      // Only Instagram takes stills or more than one file. Said plainly here
+      // rather than left to the API, because the alternative reads as a bug.
+      const blocker = selectionBlocker(account.platform, mediaKinds);
+      if (blocker) push(`${label}-selection`, blocker);
 
-      if (constraint.maxFileBytes && media.sizeBytes > constraint.maxFileBytes) {
-        push(
-          `${label}-size`,
-          `${label} limits uploads to ${(constraint.maxFileBytes / 1024 ** 3).toFixed(1)} GB.`
-        );
+      for (const item of media) {
+        const accepted =
+          item.kind === "IMAGE"
+            ? constraint.imageMimeTypes
+            : constraint.videoMimeTypes;
+
+        if (accepted.length > 0 && !accepted.includes(item.mimeType)) {
+          push(
+            `${label}-mime-${item.mimeType}`,
+            `${label} does not accept ${item.mimeType} — it needs ${accepted.join(" or ")}.`
+          );
+        }
+
+        const cap =
+          item.kind === "IMAGE" ? constraint.maxImageBytes : constraint.maxFileBytes;
+        if (cap && item.sizeBytes > cap) {
+          push(
+            `${label}-size-${item.kind}`,
+            item.kind === "IMAGE"
+              ? `${label} limits photos to ${Math.round(cap / 1024 ** 2)} MB.`
+              : `${label} limits uploads to ${(cap / 1024 ** 3).toFixed(1)} GB.`
+          );
+        }
       }
 
       if (minutesAhead < constraint.minLeadTimeMinutes) {
@@ -237,7 +470,7 @@ export default function ComposePage() {
     }
 
     return list;
-  }, [media, targets, scheduledAt, constraints, accountById, now]);
+  }, [media, mediaKinds, targets, scheduledAt, constraints, accountById, now]);
 
   /** TikTok Direct Post is invalid until the creator picks a privacy level. */
   const missingTikTokPrivacy = targets.some((target) => {
@@ -250,14 +483,19 @@ export default function ComposePage() {
   });
 
   const canSubmit =
-    media !== null &&
+    media.length > 0 &&
+    // Every file has to be in storage before the API can be told about it.
+    media.every((item) => item.storageKey !== null && !item.uploading) &&
+    // An out-of-range still is a hard stop: Instagram rejects the container
+    // rather than cropping, and that failure would land in the worker.
+    blockedItems.length === 0 &&
     targets.length > 0 &&
     warnings.length === 0 &&
     !missingTikTokPrivacy &&
     !submitting;
 
   async function submit() {
-    if (!media) return;
+    if (media.length === 0) return;
     setSubmitting(true);
     setError(null);
     setFieldErrors([]);
@@ -266,13 +504,29 @@ export default function ComposePage() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        mediaStorageKey: media.mediaStorageKey,
-        mediaMimeType: media.mimeType,
+        // Array order IS carousel order. The server reads MIME type, size and
+        // kind back from storage, so only the key, the browser-probed
+        // dimensions and any crop we applied are sent.
+        media: media.map((item) => ({
+          storageKey: item.storageKey as string,
+          ...(item.widthPx ? { widthPx: item.widthPx } : {}),
+          ...(item.heightPx ? { heightPx: item.heightPx } : {}),
+          ...(item.croppedToRatio
+            ? { croppedToRatio: item.croppedToRatio }
+            : {}),
+        })),
         caption,
         scheduledAt: new Date(scheduledAt).toISOString(),
         targets: targets.map((target) => ({
           connectedAccountId: target.connectedAccountId,
-          mediaType: target.mediaType,
+          // Derived at submit rather than stored: adding a second photo turns
+          // an Instagram photo post into a carousel, and a cached copy of the
+          // post type would be the thing that goes stale.
+          mediaType: derivePostType(
+            accountById.get(target.connectedAccountId)!.platform,
+            mediaKinds,
+            target.mediaType
+          ),
           caption: target.caption || undefined,
           platformOptions: target.options,
         })),
@@ -300,52 +554,68 @@ export default function ComposePage() {
       <header className="space-y-1">
         <h1 className="text-xl font-semibold">Schedule a post</h1>
         <p className="text-sm text-muted">
-          Upload once, publish to as many accounts as you like. Your original
-          file is uploaded untouched — OpenReply never re-encodes it.
+          Upload once, publish to as many accounts as you like. Your files go
+          up untouched unless you choose to crop a photo — that is the only
+          thing OpenReply ever re-encodes.
         </p>
       </header>
 
       {/* 1 — media */}
       <Card>
-        <StepHeading step={1} title="Video" />
-        {media ? (
-          <div className="flex items-center justify-between gap-4 rounded-lg border border-border bg-background px-4 py-3">
-            <div className="min-w-0">
-              <p className="truncate text-sm font-medium">
-                {media.filename
-                  ? decodeURIComponent(media.filename)
-                  : "Uploaded video"}
-              </p>
-              <p className="mt-0.5 text-xs text-muted">
-                {(media.sizeBytes / 1024 ** 2).toFixed(1)} MB · {media.mimeType}
-              </p>
-            </div>
-            <button
-              onClick={() => setMedia(null)}
-              className="shrink-0 rounded-md px-2 py-1 text-xs text-muted transition hover:bg-surface hover:text-foreground"
-            >
-              Replace
-            </button>
+        <StepHeading step={1} title="Media" />
+
+        {media.length > 0 && (
+          <div className="mb-3">
+            <MediaTray
+              items={media}
+              imageRange={instagramRange}
+              onReorder={reorder}
+              onRemove={removeItem}
+              onRatioChange={(id, preset) => void applyRatio(id, preset)}
+              onApplyRatioToAll={(preset) => {
+                for (const item of media) {
+                  if (item.kind === "IMAGE") void applyRatio(item.id, preset);
+                }
+              }}
+            />
           </div>
-        ) : (
-          <label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-border bg-background px-6 py-10 text-center transition hover:border-foreground/30">
+        )}
+
+        {media.length < MAX_ITEMS && (
+          <label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-border bg-background px-6 py-8 text-center transition hover:border-foreground/30">
             <span className="text-sm font-medium">
-              {uploading ? "Uploading…" : "Choose a video"}
+              {uploading
+                ? "Uploading…"
+                : media.length === 0
+                  ? "Choose photos or a video"
+                  : "Add another"}
             </span>
             <span className="text-xs text-muted">
-              MP4, MOV or WebM. Uploaded exactly as-is.
+              JPEG photos or MP4 / MOV / WebM video. Up to {MAX_ITEMS} items —
+              two or more become an Instagram carousel.
             </span>
             <input
               type="file"
-              accept="video/mp4,video/quicktime,video/webm"
+              multiple
+              accept="image/jpeg,video/mp4,video/quicktime,video/webm"
               disabled={uploading}
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file) void upload(file);
+              onChange={(event) => {
+                const picked = Array.from(event.target.files ?? []);
+                // Reset so re-picking the same file fires onChange again.
+                event.target.value = "";
+                if (picked.length > 0) void addFiles(picked);
               }}
               className="hidden"
             />
           </label>
+        )}
+
+        {media.length > 0 && (
+          <p className="mt-3 text-xs text-muted">
+            {mediaKinds.length > 1
+              ? `${mediaKinds.length} items — drag to reorder, or use the arrows.`
+              : "Drag in more files to build a carousel."}
+          </p>
         )}
       </Card>
 
@@ -415,6 +685,13 @@ export default function ComposePage() {
                       );
                       const selected = Boolean(target);
                       const isOpen = expanded === account.id;
+                      // Only Instagram takes stills or more than one file.
+                      // Disabled with the reason rather than silently accepted
+                      // and rejected later by the API.
+                      const blocked = selectionBlocker(
+                        account.platform,
+                        mediaKinds
+                      );
 
                       return (
                         <div
@@ -429,6 +706,7 @@ export default function ComposePage() {
                             <input
                               type="checkbox"
                               checked={selected}
+                              disabled={Boolean(blocked) && !selected}
                               onChange={() => toggleTarget(account)}
                               aria-label={`Post to ${account.displayName}`}
                             />
@@ -442,10 +720,14 @@ export default function ComposePage() {
                               <p className="truncate text-sm font-medium">
                                 {account.displayName}
                               </p>
-                              {account.limitation && (
-                                <p className="truncate text-xs text-warning">
-                                  {account.limitation}
-                                </p>
+                              {blocked ? (
+                                <p className="text-xs text-warning">{blocked}</p>
+                              ) : (
+                                account.limitation && (
+                                  <p className="truncate text-xs text-warning">
+                                    {account.limitation}
+                                  </p>
+                                )
                               )}
                             </div>
 
@@ -463,31 +745,66 @@ export default function ComposePage() {
 
                           {selected && target && isOpen && (
                             <div className="space-y-4 border-t border-border px-4 py-4">
-                              {meta.mediaTypes.length > 1 && (
-                                <div className="space-y-1.5">
-                                  <span className="block text-sm font-medium">
-                                    Post as
+                              {/* Instagram's shape follows from the files, so
+                                  it is reported rather than chosen — offering
+                                  "Carousel" with one file selected would be a
+                                  promise the API rejects. Facebook is a real
+                                  choice: one video, two valid destinations. */}
+                              {account.platform === "INSTAGRAM" ? (
+                                <p className="text-sm text-muted">
+                                  Posting as{" "}
+                                  <span className="font-medium text-foreground">
+                                    {meta.mediaTypes.find(
+                                      (type) =>
+                                        type.value ===
+                                        derivePostType(
+                                          account.platform,
+                                          mediaKinds
+                                        )
+                                    )?.label ?? "Reel"}
                                   </span>
-                                  <div className="flex gap-2">
-                                    {meta.mediaTypes.map((type) => (
-                                      <button
-                                        key={type.value}
-                                        onClick={() =>
-                                          updateTarget(account.id, {
-                                            mediaType: type.value,
-                                          })
-                                        }
-                                        className={`rounded-md border px-3 py-1.5 text-sm transition ${
-                                          target.mediaType === type.value
-                                            ? "border-foreground/30 bg-surface font-medium"
-                                            : "border-border text-muted hover:text-foreground"
-                                        }`}
-                                      >
-                                        {type.label}
-                                      </button>
-                                    ))}
+                                  {mediaKinds.length > 1 &&
+                                    ` — ${mediaKinds.length} items in order`}
+                                </p>
+                              ) : (
+                                meta.mediaTypes.length > 1 && (
+                                  <div className="space-y-1.5">
+                                    <span className="block text-sm font-medium">
+                                      Post as
+                                    </span>
+                                    <div className="flex gap-2">
+                                      {meta.mediaTypes.map((type) => (
+                                        <button
+                                          key={type.value}
+                                          onClick={() =>
+                                            updateTarget(account.id, {
+                                              mediaType: type.value,
+                                            })
+                                          }
+                                          className={`rounded-md border px-3 py-1.5 text-sm transition ${
+                                            target.mediaType === type.value
+                                              ? "border-foreground/30 bg-surface font-medium"
+                                              : "border-border text-muted hover:text-foreground"
+                                          }`}
+                                        >
+                                          {type.label}
+                                        </button>
+                                      ))}
+                                    </div>
                                   </div>
-                                </div>
+                                )
+                              )}
+
+                              {/* Confirmed 2026-08-08: the Instagram Audio API
+                                  is Facebook-Login-only AND Reels-only, so no
+                                  audio can be attached on our flow at all.
+                                  Saying so beats leaving the user hunting. */}
+                              {account.platform === "INSTAGRAM" && (
+                                <p className="text-xs text-muted">
+                                  Instagram&apos;s API cannot add music. Bake the
+                                  audio into your file, or add a track in the
+                                  Instagram app after publishing.
+                                </p>
                               )}
 
                               <label className="block space-y-1.5">
@@ -530,10 +847,20 @@ export default function ComposePage() {
       </Card>
 
       {(warnings.length > 0 ||
+        blockedItems.length > 0 ||
         missingTikTokPrivacy ||
         error ||
         fieldErrors.length > 0) && (
         <div className="space-y-2 rounded-xl border border-error/40 bg-error/5 px-4 py-3">
+          {blockedItems.length > 0 && (
+            <p className="text-sm text-error">
+              {blockedItems.length === 1
+                ? "One photo is outside the aspect ratio Instagram accepts."
+                : `${blockedItems.length} photos are outside the aspect ratio Instagram accepts.`}{" "}
+              Pick a crop on each, or remove them — Instagram rejects the post
+              otherwise.
+            </p>
+          )}
           {warnings.map((warning) => (
             <p key={warning} className="text-sm text-error">
               {warning}
