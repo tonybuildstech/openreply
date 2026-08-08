@@ -448,7 +448,21 @@ export default function ComposePage() {
     }
   }
 
-  /** Coalesce a burst of crop changes into one render. */
+  /**
+   * Renders run one at a time, through this chain.
+   *
+   * "Make all" fires a render for every photo at once, and each one holds a
+   * decoded bitmap plus a canvas of the same size. Ten 4000×5000 photos is
+   * roughly 1.6 GB of live pixels — enough that `toBlob` starts returning null
+   * or the tab is killed. The failures land in the catch, which reverts
+   * `ratioId`, so the visible result is a button that worked for some photos
+   * and quietly not for others.
+   *
+   * Serialising costs about a second per photo and makes it deterministic.
+   */
+  const renderChain = useRef<Promise<void>>(Promise.resolve());
+
+  /** Coalesce a burst of crop changes into one render, then queue it. */
   function scheduleRender(
     item: ComposerMediaItem,
     next: { ratioId: string; focus: CropFocus; compress: boolean }
@@ -460,7 +474,10 @@ export default function ComposePage() {
       item.id,
       window.setTimeout(() => {
         cropTimers.current.delete(item.id);
-        void renderAndUpload(item, next);
+        renderChain.current = renderChain.current
+          // One photo failing must not stall every photo behind it.
+          .catch(() => {})
+          .then(() => renderAndUpload(item, next));
       }, CROP_DEBOUNCE_MS)
     );
   }
@@ -839,6 +856,17 @@ export default function ComposePage() {
               className="hidden"
             />
           </label>
+        )}
+
+        {/* Renders are queued one at a time, so "Make all" finishes over a few
+            seconds. Saying how many are left is what stops it reading as
+            "applied to some and not others". */}
+        {media.some((item) => item.cropPending || item.uploading) && (
+          <p className="mt-3 text-xs text-muted">
+            Preparing{" "}
+            {media.filter((item) => item.cropPending || item.uploading).length}{" "}
+            of {media.length} — the files finish one at a time.
+          </p>
         )}
 
         {media.length > 0 && (

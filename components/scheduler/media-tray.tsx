@@ -290,7 +290,12 @@ export default function MediaTray({
                 </div>
 
                 <p className="text-xs text-muted">
-                  {item.uploading ? "Working…" : formatSize(item.sizeBytes)}
+                  {/* `cropPending` counts as working: renders are queued one at
+                      a time, so an item can be waiting its turn with nothing
+                      else on the tile to say so. */}
+                  {item.uploading || item.cropPending
+                    ? "Working…"
+                    : formatSize(item.sizeBytes)}
                   {item.outputWidthPx && item.outputHeightPx ? (
                     <>
                       {" · "}

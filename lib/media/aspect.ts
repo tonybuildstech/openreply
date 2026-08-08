@@ -50,6 +50,18 @@ export interface AspectPreset {
  * **9:16 is absent on purpose.** At 0.5625 it falls outside the documented
  * 0.8–1.91 range, so offering it here would produce a guaranteed container
  * ERROR. It is a Reels ratio, and lives in `REEL_PRESETS`.
+ *
+ * **3:4 is absent for the same reason, and it is the tempting one.** Instagram
+ * added 3:4 as a native feed size in 2026 and moved the profile grid to it in
+ * January, so it is genuinely the tallest shape the APP accepts. Meta's media
+ * reference still says images "must be within a 4:5 to 1.91:1 range" (checked
+ * 2026-08-08), and 0.75 is outside that. Adding it on the strength of the app
+ * would be the carousel ceiling all over again: a limit we widened past the
+ * docs, which then failed in the worker after every file had uploaded.
+ *
+ * `.dev/probe-ig-params.ts` probe 10 settles it with a real 3:4 image and no
+ * publish. If it comes back FINISHED, add the preset here and lower `min` to
+ * 0.75 in `lib/scheduler/constraints.ts` — those two and nothing else.
  */
 export const FEED_PRESETS: readonly AspectPreset[] = [
   { id: "ORIGINAL", label: "Original", ratio: null, orientation: null },

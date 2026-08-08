@@ -51,6 +51,21 @@ const QUALITY_LADDER = [0.92, 0.85, 0.78, 0.7, 0.6];
 /** Browsers cap canvas dimensions. This applies to the OUTPUT, not the source. */
 const MAX_CANVAS_DIMENSION = 8192;
 
+/**
+ * Widths to try, largest first, when an image will not fit its byte budget.
+ *
+ * **Resolution is only given up when it has to be**, and this ordering is the
+ * reason. Cropping used to downscale to 1440 unconditionally, on the argument
+ * that Instagram caps width there anyway — which is true, and still produced a
+ * worse picture: our resample plus Instagram's re-encode is two lossy passes
+ * where sending the full-size crop is one. It also turned a 6 MB photo into a
+ * 700 KB one with no warning, which reads as damage whether or not it is.
+ *
+ * So the first candidate is always the crop's own width — no resampling at all
+ * — and these are only reached when the encoder cannot hit the budget.
+ */
+const FALLBACK_WIDTHS = [INSTAGRAM_MAX_WIDTH_PX, 1080];
+
 async function toBitmap(file: File): Promise<ImageBitmap> {
   if (typeof createImageBitmap !== "function") {
     throw new Error(
@@ -128,33 +143,6 @@ function canvasToJpeg(
   });
 }
 
-/**
- * Encode at the highest quality that fits `maxBytes`.
- *
- * Returns the smallest attempt when nothing fits rather than throwing: the
- * composer already shows the resulting size and validates it against the
- * platform, and one size check that everything flows through beats a second
- * one hidden in here that disagrees with it.
- */
-async function encodeWithinBudget(
-  canvas: HTMLCanvasElement,
-  maxBytes?: number
-): Promise<Blob> {
-  if (maxBytes === undefined) {
-    return canvasToJpeg(canvas, QUALITY_LADDER[0]);
-  }
-
-  let smallest: Blob | null = null;
-
-  for (const quality of QUALITY_LADDER) {
-    const blob = await canvasToJpeg(canvas, quality);
-    if (blob.size <= maxBytes) return blob;
-    if (!smallest || blob.size < smallest.size) smallest = blob;
-  }
-
-  return smallest as Blob;
-}
-
 export interface PrepareImageOptions {
   /**
    * width ÷ height for the crop. Null means "keep the source framing" — used
@@ -165,9 +153,12 @@ export interface PrepareImageOptions {
   focus?: CropFocus;
   /** Recorded on the media row so the post remembers what was applied. */
   ratioLabel: string;
-  /** Widest output to produce. Instagram scales anything wider down itself. */
+  /** Hard ceiling on output width. Only reached if the browser cannot go wider. */
   maxWidthPx?: number;
-  /** Drop encoder quality until the result fits. Omit for "best effort". */
+  /**
+   * Shrink the result until it fits this many bytes. Omit to keep full size
+   * and full quality whatever that costs.
+   */
   maxBytes?: number;
 }
 
@@ -186,7 +177,7 @@ export async function prepareImage(
     targetRatio,
     focus = CENTRED_FOCUS,
     ratioLabel,
-    maxWidthPx = INSTAGRAM_MAX_WIDTH_PX,
+    maxWidthPx = MAX_CANVAS_DIMENSION,
     maxBytes,
   } = options;
 
@@ -199,27 +190,68 @@ export async function prepareImage(
         ? { sx: 0, sy: 0, sw: bitmap.width, sh: bitmap.height }
         : computeCoverCrop(bitmap.width, bitmap.height, targetRatio, focus);
 
-    const out = fitWithinWidth(
-      rect.sw,
-      rect.sh,
-      Math.min(maxWidthPx, MAX_CANVAS_DIMENSION),
-      // Rounding the resize must respect the ratio the CROP promised, not the
-      // source's — otherwise a boundary crop can be rounded back out of range.
-      targetRatio ?? undefined
+    const nativeWidth = Math.min(rect.sw, maxWidthPx, MAX_CANVAS_DIMENSION);
+
+    // Full size first, then progressively smaller, and only then lower quality.
+    // Losing pixels is more honest than losing detail everywhere: a 1440px
+    // image at 0.92 beats a 4000px one at 0.6, and Instagram would have taken
+    // it down to 1440 anyway.
+    const widths = [nativeWidth, ...FALLBACK_WIDTHS].filter(
+      (width, index, all) => width <= nativeWidth && all.indexOf(width) === index
     );
 
-    const canvas = drawTo(bitmap, rect, out.width, out.height);
-    const blob = await encodeWithinBudget(canvas, maxBytes);
+    let smallest: { blob: Blob; width: number; height: number } | null = null;
 
+    for (const [index, width] of widths.entries()) {
+      const out = fitWithinWidth(
+        rect.sw,
+        rect.sh,
+        width,
+        // Rounding the resize must respect the ratio the CROP promised, not
+        // the source's — otherwise a boundary crop rounds back out of range.
+        targetRatio ?? undefined
+      );
+
+      const canvas = drawTo(bitmap, rect, out.width, out.height);
+
+      // Only the last width is allowed to trade quality away; above it, the
+      // next size down is the better answer.
+      const qualities =
+        index === widths.length - 1 ? QUALITY_LADDER : [QUALITY_LADDER[0]];
+
+      for (const quality of qualities) {
+        const blob = await canvasToJpeg(canvas, quality);
+
+        if (maxBytes === undefined || blob.size <= maxBytes) {
+          return {
+            blob,
+            widthPx: out.width,
+            heightPx: out.height,
+            ratioLabel,
+            downscaled: out.width < rect.sw,
+          };
+        }
+
+        if (!smallest || blob.size < smallest.blob.size) {
+          smallest = { blob, width: out.width, height: out.height };
+        }
+      }
+    }
+
+    // Nothing fit. Hand back the smallest attempt rather than throwing: the
+    // composer already shows the size and validates it against the platform,
+    // and one size check everything flows through beats a second one hidden
+    // in here that disagrees with it.
+    const fallback = smallest as { blob: Blob; width: number; height: number };
     return {
-      blob,
-      widthPx: out.width,
-      heightPx: out.height,
+      blob: fallback.blob,
+      widthPx: fallback.width,
+      heightPx: fallback.height,
       ratioLabel,
-      downscaled: out.width < rect.sw,
+      downscaled: fallback.width < rect.sw,
     };
   } finally {
-    // Frees the decoded pixels immediately. A twenty-item carousel of 4000px
+    // Frees the decoded pixels immediately. A ten-item carousel of 4000px
     // photos is well over a gigabyte of bitmap if these are left to GC.
     bitmap.close();
   }

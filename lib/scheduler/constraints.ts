@@ -35,9 +35,11 @@ export interface PlatformConstraints {
   /**
    * Widest still the platform will publish.
    *
-   * Informational for validation — the platform downscales past it rather than
-   * rejecting — but load-bearing for the composer, which renders crops at this
-   * width. It is what turns `maxImageBytes` from a wall into a fixable problem.
+   * Never a rejection — the platform downscales past it — so nothing validates
+   * against it. It matters because it is the floor under `maxImageBytes`: an
+   * oversized photo can always be made to fit by resizing to this, and the
+   * result is what the platform would have produced anyway. The composer only
+   * resizes when the byte budget forces it, so most crops go up full size.
    */
   maxImageWidthPx?: number;
   minFrameRate?: number;

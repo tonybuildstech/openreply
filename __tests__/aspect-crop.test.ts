@@ -152,6 +152,22 @@ describe("preset ranges", () => {
     expect(FEED_PRESETS.map((p) => p.ratio)).not.toContain(0.5625);
   });
 
+  /**
+   * 3:4 is the tempting one. Instagram's app took it as a native feed size in
+   * 2026 and the profile grid moved to it, but Meta's publishing reference
+   * still documents 4:5 as the tallest the API accepts. Adding it on the
+   * strength of the app is the carousel ceiling all over again — a limit
+   * widened past the docs that then failed in the worker with every file
+   * already uploaded. Probe 10 settles it; until then this stands guard.
+   */
+  it("does not offer 3:4 while the documented range still starts at 4:5", () => {
+    const offers34 = FEED_PRESETS.some(
+      (preset) => preset.ratio !== null && Math.abs(preset.ratio - 0.75) < 0.001
+    );
+
+    expect(offers34).toBe(FEED_RANGE.min <= 0.75);
+  });
+
   it("does offer 9:16 for Reels, where the feed range does not apply", () => {
     expect(REEL_PRESETS.map((p) => p.ratio)).toContain(0.5625);
   });
