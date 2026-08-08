@@ -9,6 +9,11 @@ import {
   validateMediaForPlatform,
   validateScheduleWindow,
 } from "@/lib/scheduler/constraints";
+import {
+  mediaItemSchema,
+  normaliseUserTags,
+  type MediaUserTagInput,
+} from "@/lib/scheduler/media-input";
 import { getYouTubeQuotaState } from "@/lib/scheduler/quota";
 import {
   CAROUSEL_MAX_ITEMS,
@@ -29,25 +34,6 @@ const targetSchema = z.object({
   /** Per-platform caption override — hashtag conventions differ per network. */
   caption: z.string().max(5000).optional(),
   platformOptions: z.record(z.string(), z.unknown()).optional(),
-});
-
-/**
- * One uploaded file, in the order it should appear.
- *
- * Deliberately minimal: only the storage key and what the BROWSER knows that
- * the server cannot cheaply learn. MIME type, size and kind are all read back
- * from storage rather than accepted here — a client that could declare its own
- * kind could label a video as an image and route it down Instagram's
- * `image_url` path, which fails as an opaque container ERROR ten minutes later.
- */
-const mediaItemSchema = z.object({
-  storageKey: z.string().min(1),
-  /** Probed from an <img>/<video> element; absent when probing failed. */
-  widthPx: z.number().int().positive().optional(),
-  heightPx: z.number().int().positive().optional(),
-  durationMs: z.number().int().nonnegative().optional(),
-  /** e.g. "4:5" when the user accepted a crop. Null/absent = untouched original. */
-  croppedToRatio: z.string().max(16).optional(),
 });
 
 const createSchema = z.object({
@@ -161,6 +147,9 @@ export async function POST(request: NextRequest) {
     heightPx: number | null;
     durationMs: number | null;
     croppedToRatio: string | null;
+    // `undefined`, not `null`: on a nullable Json column Prisma treats an
+    // explicit null as ambiguous, and omitting the field leaves it NULL.
+    userTags: MediaUserTagInput[] | undefined;
   }> = [];
 
   for (const [index, item] of parsed.data.media.entries()) {
@@ -192,6 +181,7 @@ export async function POST(request: NextRequest) {
       heightPx: item.heightPx ?? null,
       durationMs: item.durationMs ?? null,
       croppedToRatio: item.croppedToRatio ?? null,
+      userTags: normaliseUserTags(item.userTags) ?? undefined,
     });
   }
 

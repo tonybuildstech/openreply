@@ -228,7 +228,7 @@ works.
 
 | Platform | Post types |
 |---|---|
-| Instagram | Reels, single photos, and **carousels of 2–20 photos and videos** |
+| Instagram | Reels, single photos, and **carousels of 2–10 photos and videos** |
 | TikTok · YouTube · Facebook Pages | a single video per post |
 
 Only Instagram accepts a still image or more than one file. Selecting several files

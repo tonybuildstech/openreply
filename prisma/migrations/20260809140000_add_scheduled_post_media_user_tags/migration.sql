@@ -1,0 +1,13 @@
+-- Per-item people tagging.
+--
+-- Instagram tags people on the individual carousel photo, not on the post, so a
+-- single post-level list has no way to say which photo someone is in. That is
+-- why this lives on the media row.
+--
+-- Shape: [{ "username": "maya.co", "x": 0.5, "y": 0.5 }]. x/y are 0–1 fractions
+-- from the top-left, and are sent for images only — Meta documents videos as
+-- taking the username alone.
+--
+-- Nullable and additive: every existing row keeps meaning "nobody tagged", and
+-- no backfill is needed.
+ALTER TABLE "ScheduledPostMedia" ADD COLUMN "userTags" JSONB;

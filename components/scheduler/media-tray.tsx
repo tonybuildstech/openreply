@@ -35,6 +35,7 @@ import {
   type CropFocus,
   type Orientation,
 } from "@/lib/media/aspect";
+import type { MediaUserTag } from "@/components/scheduler/types";
 
 export interface TrayItem {
   id: string;
@@ -62,6 +63,8 @@ export interface TrayItem {
   focus: CropFocus;
   /** Re-encoded at Instagram's width ceiling to get under the file-size cap. */
   compressed: boolean;
+  /** People tagged in THIS item — Instagram tags per photo, not per post. */
+  userTags: MediaUserTag[];
   uploading: boolean;
   /** The displayed crop has not been rendered to a file yet. */
   cropPending: boolean;
@@ -80,8 +83,29 @@ interface MediaTrayProps {
   onFocusChange: (id: string, focus: CropFocus) => void;
   /** Re-encode at Instagram's own 1440px ceiling to get under the size cap. */
   onCompress: (id: string) => void;
+  /** Open the tagging modal for this item. */
+  onTagPeople: (id: string) => void;
   /** Applies one ratio to every image — carousels look best uniform. */
   onApplyRatioToAll: (preset: AspectPreset) => void;
+}
+
+/** A luggage-style tag, the conventional "tag someone" affordance. */
+function TagIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+      className="h-3.5 w-3.5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M20.6 13.4 12 22l-9-9V3h10l7.6 7.6a2 2 0 0 1 0 2.8z" />
+      <circle cx="7.5" cy="7.5" r="1.5" fill="currentColor" stroke="none" />
+    </svg>
+  );
 }
 
 const ORIENTATION_WORD: Record<Orientation, string> = {
@@ -155,6 +179,7 @@ export default function MediaTray({
   onRatioChange,
   onFocusChange,
   onCompress,
+  onTagPeople,
   onApplyRatioToAll,
 }: MediaTrayProps) {
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
@@ -379,6 +404,28 @@ export default function MediaTray({
                 )}
 
                 <div className="flex items-center gap-1">
+                  {/* Tagging is per item because Instagram tags a person in a
+                      specific photo — the post-level list this replaces could
+                      never say which photo someone was in. */}
+                  <button
+                    type="button"
+                    onClick={() => onTagPeople(item.id)}
+                    title={
+                      item.userTags.length > 0
+                        ? `Tagged: ${item.userTags.map((tag) => `@${tag.username}`).join(", ")}`
+                        : "Tag people in this item"
+                    }
+                    aria-label={`Tag people in ${item.filename}`}
+                    className={`flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs transition ${
+                      item.userTags.length > 0
+                        ? "border-foreground/30 bg-surface font-medium"
+                        : "border-border text-muted hover:text-foreground"
+                    }`}
+                  >
+                    <TagIcon />
+                    {item.userTags.length > 0 && item.userTags.length}
+                  </button>
+
                   <button
                     type="button"
                     onClick={() => onReorder(index, index - 1)}

@@ -86,13 +86,15 @@ function fakeMeta(options: { quotaUsage?: number } = {}) {
 
 function mediaItem(
   position: number,
-  kind: "IMAGE" | "VIDEO" = "IMAGE"
+  kind: "IMAGE" | "VIDEO" = "IMAGE",
+  userTags: unknown = null
 ): Record<string, unknown> {
   return {
     position,
     storageKey: `ws1/item${position}.${kind === "IMAGE" ? "jpg" : "mp4"}`,
     mimeType: kind === "IMAGE" ? "image/jpeg" : "video/mp4",
     kind,
+    userTags,
   };
 }
 
@@ -471,6 +473,130 @@ describe("Instagram post attribution", () => {
     await publish(makePost("IMAGE", [mediaItem(0)]));
 
     expect(containerCalls()).toHaveLength(1);
+  });
+
+  it("blames the post, not the options, when the clean retry fails too", async () => {
+    // The real report this came from: a 17-item carousel was rejected for its
+    // ITEM COUNT, and the message the user saw was the retry's — which read as
+    // "Instagram rejected your collaborators". Both attempts fail here; the
+    // error surfaced must be the one that describes the actual fault.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        const target = String(url);
+        if (target.includes("content_publishing_limit")) {
+          return json({ data: [{ quota_usage: 0, config: { quota_total: 50 } }] });
+        }
+        if (target.endsWith("/media")) {
+          return json(
+            {
+              error: {
+                message: "The post has too little or too many attachments",
+                code: 100,
+              },
+            },
+            400
+          );
+        }
+        throw new Error(`unexpected request: ${target}`);
+      })
+    );
+
+    await expect(
+      publish(
+        makePost("IMAGE", [mediaItem(0)], "a still", { collaborators: "studio" })
+      )
+    ).rejects.toThrow(/too many attachments/);
+  });
+});
+
+/**
+ * Per-item people tagging.
+ *
+ * Instagram tags a person in a SPECIFIC photo — the container carrying the tag
+ * is that photo's own child container. A post-level list cannot express which
+ * item someone is in, which is why the composer-wide field it replaced could
+ * never work for a carousel.
+ */
+describe("Instagram per-item people tags", () => {
+  it("tags each carousel child with its own people, not the parent", async () => {
+    vi.stubGlobal("fetch", fakeMeta());
+
+    await publish(
+      makePost("CAROUSEL", [
+        mediaItem(0, "IMAGE", [{ username: "maya.co", x: 0.25, y: 0.75 }]),
+        mediaItem(1, "IMAGE", [{ username: "alex" }]),
+      ])
+    );
+
+    const containers = containerCalls();
+    const [first, second] = containers;
+
+    expect(JSON.parse(first.params.get("user_tags") as string)).toEqual([
+      { username: "maya.co", x: 0.25, y: 0.75 },
+    ]);
+    // Unplaced tags land in the centre rather than being sent incomplete —
+    // Meta documents x and y as required for image tags.
+    expect(JSON.parse(second.params.get("user_tags") as string)).toEqual([
+      { username: "alex", x: 0.5, y: 0.5 },
+    ]);
+    expect(containers.at(-1)!.params.get("user_tags")).toBeNull();
+  });
+
+  it("sends video tags without coordinates", async () => {
+    vi.stubGlobal("fetch", fakeMeta());
+
+    await publish(
+      makePost("CAROUSEL", [
+        mediaItem(0, "VIDEO", [{ username: "alex", x: 0.2, y: 0.2 }]),
+        mediaItem(1, "IMAGE"),
+      ])
+    );
+
+    // Meta documents video tags as {username} alone. Coordinates there are an
+    // invented parameter shape, so they are dropped rather than passed through.
+    expect(JSON.parse(containerCalls()[0].params.get("user_tags") as string)).toEqual(
+      [{ username: "alex" }]
+    );
+  });
+
+  it("prefers an item's own tags over the older post-level list", async () => {
+    vi.stubGlobal("fetch", fakeMeta());
+
+    await publish(
+      makePost("IMAGE", [mediaItem(0, "IMAGE", [{ username: "maya.co" }])], "x", {
+        userTags: "someone.else",
+      })
+    );
+
+    expect(JSON.parse(containerCalls()[0].params.get("user_tags") as string)).toEqual(
+      [{ username: "maya.co", x: 0.5, y: 0.5 }]
+    );
+  });
+
+  it("still honours the post-level list when an item has no tags of its own", async () => {
+    // Posts scheduled before per-item tagging existed must keep working.
+    vi.stubGlobal("fetch", fakeMeta());
+
+    await publish(
+      makePost("IMAGE", [mediaItem(0)], "x", { userTags: "someone.else" })
+    );
+
+    expect(JSON.parse(containerCalls()[0].params.get("user_tags") as string)).toEqual(
+      [{ username: "someone.else" }]
+    );
+  });
+
+  it("ignores a malformed tag blob rather than failing the post", async () => {
+    vi.stubGlobal("fetch", fakeMeta());
+
+    // The column is JSON, so anything could be in it after a hand edit or an
+    // older shape. A bad value must not take the post down with it.
+    await publish(
+      makePost("IMAGE", [mediaItem(0, "IMAGE", [{ nope: 1 }, "string", null])])
+    );
+
+    expect(containerCalls()[0].params.get("user_tags")).toBeNull();
   });
 });
 

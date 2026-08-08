@@ -42,10 +42,13 @@ import {
   type AspectPreset,
   type CropFocus,
 } from "@/lib/media/aspect";
+import TagPeopleModal from "@/components/scheduler/tag-people-modal";
+import { MAX_TAGS_PER_ITEM } from "@/lib/scheduler/media-input";
 import { CAROUSEL_MAX_ITEMS } from "@/lib/scheduler/types";
 import type {
   ComposerAccount,
   ComposerTarget,
+  MediaUserTag,
   TargetOptions,
 } from "@/components/scheduler/types";
 
@@ -127,6 +130,8 @@ export default function ComposePage() {
   );
   const [targets, setTargets] = useState<ComposerTarget[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
+  /** Media item whose tagging modal is open, if any. */
+  const [taggingId, setTaggingId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<string[]>([]);
@@ -266,6 +271,7 @@ export default function ComposePage() {
       storageKey: null,
       ratioId: "ORIGINAL",
       focus: CENTRED_FOCUS,
+      userTags: [],
       croppedToRatio: null,
       compressed: false,
       uploading: true,
@@ -288,14 +294,21 @@ export default function ComposePage() {
         outputHeightPx: probe.heightPx,
       });
 
+      // Claimed even though nothing has been cropped yet: the user can pick a
+      // ratio while this transfer is still running, and the crop that starts
+      // from that click must be able to overrule this result.
+      const stale = claimWrite(item.id);
+
       try {
         const { storageKey, sizeBytes } = await uploadBlob(
           item.file,
           item.file.type,
           item.file.name
         );
+        if (stale()) continue;
         patchItem(item.id, { storageKey, sizeBytes, uploading: false });
       } catch (uploadError) {
+        if (stale()) continue;
         patchItem(item.id, {
           uploading: false,
           error:
@@ -310,16 +323,36 @@ export default function ComposePage() {
   }
 
   /**
-   * Renders in flight, per item.
+   * Writes in flight, per item.
    *
-   * A drag fires many changes and each one starts an async decode + encode +
-   * upload. Without a sequence number the LAST result to arrive wins rather
-   * than the LATEST one requested, and the file that publishes is whichever
-   * encode happened to finish last — a crop the user never chose and cannot
-   * see, because the overlay shows their intent either way.
+   * **Every asynchronous path that sets `storageKey` must claim a generation
+   * here first.** Two of them exist and they can overlap: the initial upload of
+   * the file the user picked, and a crop re-render. Whichever finishes LAST
+   * wins the field, and that is not necessarily the one the user asked for.
+   *
+   * That is not hypothetical — it is the bug behind "apply 4:5 to all applies
+   * visually but not to the post". `addFiles` uploads the picked files one at a
+   * time, so clicking the button while later ones are still in flight starts a
+   * crop for an item whose original upload has not landed yet. The crop
+   * finishes first, then the original upload overwrites `storageKey` with the
+   * uncropped file. The tile still shows the crop, because `ratioId` was never
+   * touched, and `cropPending` is already false, so submit is enabled and sends
+   * the wrong key. Only the items still uploading at click time are affected,
+   * which is why it looked like the button worked for some photos.
    */
-  const renderSeq = useRef(new Map<string, number>());
+  const writeSeq = useRef(new Map<string, number>());
   const cropTimers = useRef(new Map<string, number>());
+
+  /**
+   * Take ownership of this item's file. Returns a check for "superseded".
+   *
+   * Call before starting the work, check before writing the result.
+   */
+  function claimWrite(id: string): () => boolean {
+    const seq = (writeSeq.current.get(id) ?? 0) + 1;
+    writeSeq.current.set(id, seq);
+    return () => writeSeq.current.get(id) !== seq;
+  }
 
   useEffect(() => {
     const timers = cropTimers.current;
@@ -342,11 +375,7 @@ export default function ComposePage() {
     next: { ratioId: string; focus: CropFocus; compress: boolean }
   ) {
     const { id, file } = item;
-    const seq = (renderSeq.current.get(id) ?? 0) + 1;
-    renderSeq.current.set(id, seq);
-
-    /** Drop a result that a newer request has already superseded. */
-    const stale = () => renderSeq.current.get(id) !== seq;
+    const stale = claimWrite(id);
 
     const preset =
       FEED_PRESETS.find((option) => option.id === next.ratioId) ??
@@ -487,12 +516,22 @@ export default function ComposePage() {
     });
   }
 
+  /**
+   * Tags are metadata, not pixels — saving them re-renders nothing and
+   * re-uploads nothing. They travel with the media row at submit.
+   */
+  function saveTags(id: string, tags: MediaUserTag[]) {
+    patchItem(id, { userTags: tags });
+    setTaggingId(null);
+  }
+
   function removeItem(id: string) {
-    // Cancel any pending render so it cannot resurrect a removed item's state.
+    // Cancel any pending render, and claim the write so an in-flight upload
+    // cannot resurrect a removed item's state.
     const timer = cropTimers.current.get(id);
     if (timer !== undefined) window.clearTimeout(timer);
     cropTimers.current.delete(id);
-    renderSeq.current.set(id, (renderSeq.current.get(id) ?? 0) + 1);
+    claimWrite(id);
 
     setMedia((current) => {
       const target = current.find((item) => item.id === id);
@@ -677,6 +716,9 @@ export default function ComposePage() {
           ...(item.croppedToRatio
             ? { croppedToRatio: item.croppedToRatio }
             : {}),
+          // Per item: Instagram tags a person in a specific photo, and the
+          // carousel child container is what carries the tag.
+          ...(item.userTags.length > 0 ? { userTags: item.userTags } : {}),
         })),
         caption,
         scheduledAt: new Date(scheduledAt).toISOString(),
@@ -712,8 +754,30 @@ export default function ComposePage() {
 
   const activeAccounts = accounts.filter((a) => a.status === "ACTIVE");
 
+  const taggingItem = media.find((item) => item.id === taggingId) ?? null;
+
   return (
     <div className="max-w-4xl space-y-5 pb-12">
+      {/*
+        Keyed by item so opening a different tile remounts the modal, which is
+        what seeds its draft from that item's tags. An effect syncing the draft
+        would fight the user's own edits.
+      */}
+      {taggingItem && (
+        <TagPeopleModal
+          key={taggingItem.id}
+          open
+          previewUrl={taggingItem.previewUrl}
+          filename={taggingItem.filename}
+          kind={taggingItem.kind}
+          position={media.indexOf(taggingItem) + 1}
+          maxTags={MAX_TAGS_PER_ITEM}
+          tags={taggingItem.userTags}
+          onSave={(tags) => saveTags(taggingItem.id, tags)}
+          onClose={() => setTaggingId(null)}
+        />
+      )}
+
       <header className="space-y-1">
         <h1 className="text-xl font-semibold">Schedule a post</h1>
         <p className="text-sm text-muted">
@@ -738,6 +802,7 @@ export default function ComposePage() {
               onRatioChange={applyRatio}
               onFocusChange={applyFocus}
               onCompress={compressItem}
+              onTagPeople={setTaggingId}
               onApplyRatioToAll={(preset) => {
                 for (const item of media) {
                   if (item.kind === "IMAGE") applyRatio(item.id, preset);

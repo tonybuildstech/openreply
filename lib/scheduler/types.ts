@@ -183,23 +183,31 @@ export const MEDIA_TYPE_BY_PLATFORM: Record<
  * composer that accepts 20 against an API that rejects at 10, or an API that
  * accepts 20 against an adapter that refuses.
  *
- * **The maximum is 20, and that is NOT what Meta's API docs say.** The
- * Instagram Login content-publishing guide states 10, twice and unambiguously
- * ("a comma separated list of up to 10 container IDs"). Instagram's own app
- * allows 20, and Meta's API documentation is known to lag the product — this
- * integration has already been burned twice by docs that did not match the live
- * API (`upload_type=resumable`, `audio_name`). Set to 20 on that basis, at the
- * maintainer's direction, **not on evidence**.
+ * **The maximum is 10, and this was 20 for one day. A live post proved it.**
  *
- * If the API really does cap at 10, an 11-item carousel fails when the PARENT
- * container is created — in the worker, at the scheduled minute, after every
- * child has already uploaded. `.dev/probe-ig-params.ts` probe 9 walks 11 → 20
- * and reports the real cutoff; set this to whatever it finds.
+ * Meta's Instagram Login guide states 10, twice and unambiguously ("a comma
+ * separated list of up to 10 container IDs"). Instagram's own app allows 20,
+ * and Meta's docs have lagged the product before — this integration has been
+ * burned twice by documentation that did not match the live API
+ * (`upload_type=resumable`, `audio_name`). So 20 was set deliberately, against
+ * the docs, and recorded here as not evidence-backed.
+ *
+ * The evidence arrived on 2026-08-08. A 17-image carousel failed at the PARENT
+ * container with `Unsupported post type. The post has too little or too many
+ * attachments to qualify as a carousel` — in the worker, at the scheduled
+ * minute, after all 17 children had uploaded. Exactly the predicted failure.
+ * Back to the documented 10, which is the only number now supported by both
+ * the docs and an observation.
+ *
+ * Strictly, 17 failing proves the ceiling is below 17, not that it is 10.
+ * `.dev/probe-ig-params.ts` probe 9 walks the range and reports the real
+ * cutoff without publishing. Until it runs, the documented value is the only
+ * defensible one — guessing past the docs is what produced this.
  *
  * The minimum of 2 is ours, not Meta's — the docs state no floor (Q14).
  */
 export const CAROUSEL_MIN_ITEMS = 2;
-export const CAROUSEL_MAX_ITEMS = 20;
+export const CAROUSEL_MAX_ITEMS = 10;
 
 /**
  * How many files each post type takes, and of what kind.

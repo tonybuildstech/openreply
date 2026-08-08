@@ -133,10 +133,6 @@ function InstagramOptions({
   onChange,
 }: Pick<PlatformOptionsProps, "mediaType" | "value" | "onChange">) {
   const isReel = mediaType === "REEL";
-  // Meta documents people-tagging on carousel CHILDREN, and the composer has no
-  // way to say which item someone is in, so the whole-post list cannot be
-  // honoured here.
-  const supportsUserTags = mediaType !== "CAROUSEL";
 
   return (
     <div className="space-y-4">
@@ -202,15 +198,6 @@ function InstagramOptions({
           />
         </Field>
 
-        {supportsUserTags && (
-          <Field label="Tag people" hint="Usernames, comma separated.">
-            <TextInput
-              value={value.userTags}
-              onChange={(v) => onChange({ userTags: v || undefined })}
-              placeholder="maya.co, alex"
-            />
-          </Field>
-        )}
       </OptionGrid>
 
       {isReel && (
@@ -222,12 +209,14 @@ function InstagramOptions({
         />
       )}
 
-      {!supportsUserTags && (
-        <p className="text-xs text-muted">
-          Instagram tags people per carousel item, not per post, so tagging is
-          unavailable on a carousel. Location and collaborators still apply.
-        </p>
-      )}
+      {/*
+        Tagging lives on the media tile, not here. Instagram tags a person in a
+        specific photo — the container that carries the tag is that photo's own
+        — so one list for the whole post cannot say who is in which item.
+      */}
+      <p className="text-xs text-muted">
+        To tag people, use the tag button on each photo or video up in Media.
+      </p>
     </div>
   );
 }

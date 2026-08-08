@@ -440,6 +440,13 @@ model ScheduledPostMedia {
   /// untouched original — the default, and the only path that never re-encodes.
   croppedToRatio String?
 
+  /// People tagged in THIS item: `[{ username, x, y }]`, x/y as 0–1 fractions
+  /// from the top-left. Per item rather than per post because Instagram tags
+  /// people on the individual carousel photo, and a post-level list cannot say
+  /// which photo someone is in. Images carry coordinates; videos take the
+  /// username alone.
+  userTags Json?
+
   createdAt DateTime @default(now())
 
   post ScheduledPost @relation(fields: [scheduledPostId], references: [id], onDelete: Cascade)

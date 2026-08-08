@@ -18,6 +18,11 @@ import {
   type EditableField,
 } from "@/lib/scheduler/editing";
 import {
+  mediaItemSchema,
+  normaliseUserTags,
+  type MediaUserTagInput,
+} from "@/lib/scheduler/media-input";
+import {
   CAROUSEL_MAX_ITEMS,
   MEDIA_TYPE_BY_PLATFORM,
   SCHEDULED_POST_TYPES,
@@ -31,15 +36,6 @@ import {
 export const dynamic = "force-dynamic";
 
 const actionSchema = z.object({ action: z.enum(["retry", "cancel"]) });
-
-/** Same contract as the create route — see the note on `mediaItemSchema` there. */
-const mediaItemSchema = z.object({
-  storageKey: z.string().min(1),
-  widthPx: z.number().int().positive().optional(),
-  heightPx: z.number().int().positive().optional(),
-  durationMs: z.number().int().nonnegative().optional(),
-  croppedToRatio: z.string().max(16).optional(),
-});
 
 const patchSchema = z.object({
   caption: z.string().max(5000).optional(),
@@ -65,6 +61,8 @@ interface NewMediaItem {
   heightPx: number | null;
   durationMs: number | null;
   croppedToRatio: string | null;
+  /** Omitted rather than nulled — see the note in the create route. */
+  userTags: MediaUserTagInput[] | undefined;
 }
 
 /** BigInt does not survive JSON.stringify, and every item carries one. */
@@ -294,6 +292,7 @@ export async function PATCH(
         heightPx: item.heightPx ?? null,
         durationMs: item.durationMs ?? null,
         croppedToRatio: item.croppedToRatio ?? null,
+        userTags: normaliseUserTags(item.userTags) ?? undefined,
       });
     }
 
@@ -353,6 +352,9 @@ export async function PATCH(
             ? replacementMedia.map((item, index) => ({
                 ...post.media[index],
                 ...item,
+                // The write path omits this field to leave the column NULL;
+                // the adapter reads a row, where absent IS null.
+                userTags: item.userTags ?? null,
               }))
             : post.media,
         },

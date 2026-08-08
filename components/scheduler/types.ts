@@ -22,8 +22,29 @@ export interface InstagramTargetOptions {
   collaborators?: string;
   /** Facebook Page ID representing the location to tag. */
   locationId?: string;
-  /** Comma-separated IG usernames to tag in the Reel. */
+  /**
+   * Comma-separated IG usernames, applied to the whole post.
+   *
+   * **Superseded by per-item tags** (`MediaUserTag` below), which is how
+   * Instagram actually models tagging — a person is tagged in one photo of a
+   * carousel, and this field cannot say which. No longer offered in the
+   * composer; still read by the adapter as a fallback so posts scheduled before
+   * per-item tagging existed publish the way they were set up.
+   */
   userTags?: string;
+}
+
+/**
+ * One person tagged in one media item.
+ *
+ * `x`/`y` are fractions from the top-left of the image. Meta documents them as
+ * required for image tags and absent for video tags, so they are optional here
+ * and the adapter supplies the centre for anything the user did not place.
+ */
+export interface MediaUserTag {
+  username: string;
+  x?: number;
+  y?: number;
 }
 
 export interface YouTubeTargetOptions {

@@ -379,6 +379,27 @@ function postAttributionParams(
 }
 
 /**
+ * Attribution for a one-file post, preferring the tags placed on the file
+ * itself.
+ *
+ * Per-item tags win over the post-level list because they are the specific
+ * thing the user positioned on THIS photo. The post-level list stays honoured
+ * when there are none, so posts scheduled before per-item tagging existed still
+ * publish the way they were set up.
+ */
+function singleItemAttribution(
+  post: ScheduledPostWithMedia,
+  media: ScheduledPostMedia
+): URLSearchParams {
+  const itemTags = toItemUserTagsParam(media);
+  const params = postAttributionParams(post, { userTags: itemTags === null });
+
+  if (itemTags) params.set("user_tags", itemTags);
+
+  return params;
+}
+
+/**
  * Create a container with the attribution options, and fall back to creating it
  * without them if Meta refuses.
  *
@@ -427,12 +448,21 @@ async function createContainerWithOptions(
       throw error;
     }
 
-    const containerId = await createMediaContainer(
-      igUserId,
-      new URLSearchParams(base),
-      accessPlaintextToken,
-      `${context} (retry without collaborators, location and tags)`
-    );
+    let containerId: string;
+    try {
+      containerId = await createMediaContainer(
+        igUserId,
+        new URLSearchParams(base),
+        accessPlaintextToken,
+        context
+      );
+    } catch {
+      // The retry failed too, so the attribution was never the problem — the
+      // post itself is wrong. Rethrow the FIRST error: it describes the real
+      // fault, and surfacing the retry's would blame the collaborator setting
+      // for, say, a carousel with the wrong number of items.
+      throw error;
+    }
 
     notices.push(
       `Instagram rejected the ${[...attribution.keys()].join(", ")} setting${
@@ -468,7 +498,51 @@ function imageParams(
   return params;
 }
 
-/** One carousel child. Never carries a caption — that lives on the parent. */
+/**
+ * People tagged in one specific item, as Meta wants them.
+ *
+ * The shape differs by kind, which is why this cannot be a single stored blob
+ * passed straight through: Meta documents image tags as `{username, x, y}` and
+ * video tags as `{username}` alone. Sending coordinates on a video is an
+ * invented parameter shape, so they are dropped there.
+ *
+ * Missing coordinates on an image default to the centre. Meta documents x and y
+ * as required for images, and a tag Instagram places itself is better than a
+ * container rejected for an incomplete one.
+ */
+export function toItemUserTagsParam(
+  media: Pick<ScheduledPostMedia, "kind" | "userTags">
+): string | null {
+  const raw = media.userTags;
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+
+  const tags = raw
+    .filter(
+      (tag): tag is { username: string; x?: number; y?: number } =>
+        typeof tag === "object" &&
+        tag !== null &&
+        typeof (tag as { username?: unknown }).username === "string"
+    )
+    .map((tag) => {
+      const username = tag.username.trim().replace(/^@/, "");
+      if (media.kind === "VIDEO") return { username };
+      return {
+        username,
+        x: typeof tag.x === "number" ? tag.x : 0.5,
+        y: typeof tag.y === "number" ? tag.y : 0.5,
+      };
+    })
+    .filter((tag) => tag.username.length > 0);
+
+  return tags.length > 0 ? JSON.stringify(tags) : null;
+}
+
+/**
+ * One carousel child. Never carries a caption — that lives on the parent.
+ *
+ * People tags DO belong here rather than on the parent: Instagram tags a person
+ * in a specific photo, and the parent has no way to express which one.
+ */
 function carouselChildParams(media: ScheduledPostMedia): URLSearchParams {
   const params = new URLSearchParams({ is_carousel_item: "true" });
 
@@ -481,6 +555,9 @@ function carouselChildParams(media: ScheduledPostMedia): URLSearchParams {
     params.set("media_type", "VIDEO");
     params.set("video_url", signedUrlFor(media.storageKey));
   }
+
+  const userTags = toItemUserTagsParam(media);
+  if (userTags) params.set("user_tags", userTags);
 
   return params;
 }
@@ -685,7 +762,7 @@ async function prepareContainer(
     const containerId = await createContainerWithOptions(
       igUserId,
       imageParams(post, media),
-      postAttributionParams(post),
+      singleItemAttribution(post, media),
       accessPlaintextToken,
       "Instagram image container",
       notices
@@ -704,7 +781,7 @@ async function prepareContainer(
     const containerId = await createContainerWithOptions(
       igUserId,
       reelParams(post, media),
-      postAttributionParams(post),
+      singleItemAttribution(post, media),
       accessPlaintextToken,
       "Instagram Reel container",
       notices
