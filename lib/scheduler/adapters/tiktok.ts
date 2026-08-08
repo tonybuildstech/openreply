@@ -27,15 +27,17 @@
 
 import type {
   ConnectedAccount,
-  ScheduledPost,
+  ScheduledPostMedia,
 } from "@/app/generated/prisma/client";
 import { fetchWithTimeout, toResponseSnippet } from "@/lib/scheduler/http";
 import { recordQuotaUsage } from "@/lib/scheduler/quota";
 import { resolveAccessToken } from "@/lib/scheduler/tokens";
 import {
   PublishError,
+  requireSingleMedia,
   type PublishAdapter,
   type PublishStatus,
+  type ScheduledPostWithMedia,
 } from "@/lib/scheduler/types";
 import { getMediaStorage } from "@/lib/storage";
 
@@ -145,7 +147,7 @@ async function tiktokRequest(
  * to respect the worker's 250 MB cap.
  */
 async function uploadChunks(
-  post: ScheduledPost,
+  media: ScheduledPostMedia,
   uploadUrl: string,
   sizeBytes: number,
   chunkSize: number,
@@ -160,7 +162,7 @@ async function uploadChunks(
     const end =
       index === totalChunkCount - 1 ? sizeBytes - 1 : start + chunkSize - 1;
 
-    const stream = storage.createReadStream(post.mediaStorageKey, {
+    const stream = storage.createReadStream(media.storageKey, {
       start,
       end,
     });
@@ -168,7 +170,7 @@ async function uploadChunks(
     const response = await fetchWithTimeout(uploadUrl, {
       method: "PUT",
       headers: {
-        "Content-Type": post.mediaMimeType,
+        "Content-Type": media.mimeType,
         "Content-Length": String(end - start + 1),
         "Content-Range": `bytes ${start}-${end}/${sizeBytes}`,
       },
@@ -202,14 +204,17 @@ export const tiktokAdapter: PublishAdapter = {
   platform: "TIKTOK",
   dispatchMode: "QUEUED",
 
-  async schedule(post: ScheduledPost, account: ConnectedAccount) {
+  async schedule(post: ScheduledPostWithMedia, account: ConnectedAccount) {
     const accessPlaintextToken = await resolveAccessToken(account);
     const metadata = (account.metadata ?? {}) as TikTokAccountMetadata;
     const options = (post.platformOptions ?? {}) as TikTokPostOptions;
     const postMode: TikTokPostMode = metadata.postMode ?? "INBOX";
+    // TikTok publishes one video per post. Throws on a carousel rather than
+    // silently sending its first item.
+    const media = requireSingleMedia(post);
 
     const storage = getMediaStorage();
-    const { size } = await storage.stat(post.mediaStorageKey);
+    const { size } = await storage.stat(media.storageKey);
     const { chunkSize, totalChunkCount } = planChunks(size);
 
     const sourceInfo = {
@@ -265,7 +270,7 @@ export const tiktokAdapter: PublishAdapter = {
       );
     }
 
-    await uploadChunks(post, uploadUrl, size, chunkSize, totalChunkCount);
+    await uploadChunks(media, uploadUrl, size, chunkSize, totalChunkCount);
 
     await recordQuotaUsage({
       platform: "TIKTOK",
@@ -283,7 +288,7 @@ export const tiktokAdapter: PublishAdapter = {
   },
 
   async checkStatus(
-    post: ScheduledPost,
+    post: ScheduledPostWithMedia,
     account: ConnectedAccount
   ): Promise<PublishStatus> {
     if (!post.platformContainerId) return "pending";

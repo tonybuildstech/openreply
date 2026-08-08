@@ -367,12 +367,9 @@ model ScheduledPost {
   workspaceId        String
   connectedAccountId String
 
-  // Key into the media store (lib/storage). Points at the ORIGINAL file — this
-  // pipeline never transcodes.
-  mediaStorageKey String
-  mediaMimeType   String
-  mediaSizeBytes  BigInt
-
+  // The shape of the POST, not of any one file: REEL, IMAGE, CAROUSEL, …
+  // A carousel is one post with many `media` rows. The files themselves live
+  // in the `media` relation below — this model holds no storage key of its own.
   mediaType ScheduledPostMediaType
   caption   String                 @default("")
 
@@ -401,15 +398,55 @@ model ScheduledPost {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  workspace        Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  connectedAccount ConnectedAccount @relation(fields: [connectedAccountId], references: [id], onDelete: Cascade)
+  workspace        Workspace            @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  connectedAccount ConnectedAccount     @relation(fields: [connectedAccountId], references: [id], onDelete: Cascade)
   jobLogs          PublishJobLog[]
+  media            ScheduledPostMedia[]
 
   // Exactly the fire-time poll's predicate.
   @@index([status, scheduledAt])
   @@index([workspaceId, scheduledAt])
   @@index([connectedAccountId])
   @@index([batchId])
+}
+
+/// One file in a post, in carousel order.
+///
+/// Single-media posts — every post before 2026-08-08 — have exactly one row at
+/// position 0. Instagram carousels have 2–10. This is a child table rather than
+/// a JSON column because `position` needs a uniqueness constraint and the probe
+/// data below needs to be queryable: a JSON blob would let two items claim the
+/// same slot and leave "which posts did we crop?" unanswerable.
+model ScheduledPostMedia {
+  id              String @id @default(cuid())
+  scheduledPostId String
+
+  // 0-based. Contiguous, and the order the platform is told to render.
+  position   Int
+  storageKey String
+  mimeType   String
+  sizeBytes  BigInt
+  kind       ScheduledPostMediaKind
+
+  // Probed in the browser at selection time — nothing server-side ever opens
+  // the file. Null means probing failed; treat as unknown, never as invalid.
+  // Instagram rejects images outside 4:5–1.91:1 rather than cropping them,
+  // which is the only reason we care about dimensions at all.
+  widthPx    Int?
+  heightPx   Int?
+  durationMs Int?
+
+  /// Set only when the user accepted a crop, e.g. "4:5". Null means this is the
+  /// untouched original — the default, and the only path that never re-encodes.
+  croppedToRatio String?
+
+  createdAt DateTime @default(now())
+
+  post ScheduledPost @relation(fields: [scheduledPostId], references: [id], onDelete: Cascade)
+
+  // Two items cannot occupy the same carousel slot.
+  @@unique([scheduledPostId, position])
+  @@index([scheduledPostId])
 }
 
 // Append-only audit trail. responseSnippet is truncated and scrubbed before
@@ -465,12 +502,23 @@ enum ConnectedAccountStatus {
   DISABLED
 }
 
+/// The shape of a post, not the type of any one file. IMAGE and CAROUSEL are
+/// Instagram feed posts; the rest are single-video posts.
 enum ScheduledPostMediaType {
   REEL
+  IMAGE
+  CAROUSEL
   SHORT
   TIKTOK_VIDEO
   FACEBOOK_REEL
   FACEBOOK_VIDEO
+}
+
+/// What a single ScheduledPostMedia row holds. Derived server-side from the
+/// stored content type — never taken from the client.
+enum ScheduledPostMediaKind {
+  IMAGE
+  VIDEO
 }
 
 enum ScheduledPostStatus {

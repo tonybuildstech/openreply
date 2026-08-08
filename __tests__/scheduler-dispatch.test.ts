@@ -7,7 +7,12 @@ import {
 } from "../lib/scheduler/adapters";
 import { toUserTagsParam } from "../lib/scheduler/adapters/instagram";
 import { toTagList } from "../lib/scheduler/adapters/youtube";
-import { MEDIA_TYPE_BY_PLATFORM, PublishError } from "../lib/scheduler/types";
+import {
+  MEDIA_SHAPE_BY_POST_TYPE,
+  MEDIA_TYPE_BY_PLATFORM,
+  PublishError,
+  requireSingleMedia,
+} from "../lib/scheduler/types";
 
 /**
  * The native/queued split is the spine of this feature, and getting a platform
@@ -56,7 +61,12 @@ describe("dispatch routing", () => {
 
 describe("media types per platform", () => {
   it("maps each platform to media types only it accepts", () => {
-    expect(MEDIA_TYPE_BY_PLATFORM.INSTAGRAM).toEqual(["REEL"]);
+    // Instagram is the only platform that takes stills or more than one file.
+    expect(MEDIA_TYPE_BY_PLATFORM.INSTAGRAM).toEqual([
+      "REEL",
+      "IMAGE",
+      "CAROUSEL",
+    ]);
     expect(MEDIA_TYPE_BY_PLATFORM.YOUTUBE).toEqual(["SHORT"]);
     expect(MEDIA_TYPE_BY_PLATFORM.TIKTOK).toEqual(["TIKTOK_VIDEO"]);
     expect(MEDIA_TYPE_BY_PLATFORM.FACEBOOK_PAGE).toEqual([
@@ -126,5 +136,95 @@ describe("PublishError classification", () => {
     // burns attempts and leaves the account looking healthy.
     expect(error.retryable).toBe(false);
     expect(error.options.needsReauth).toBe(true);
+  });
+});
+
+/**
+ * The backstop for the one genuinely destructive mistake this refactor could
+ * make: publishing item 0 of a carousel to a platform that takes one file, and
+ * calling it a success. The user would see a post go out that is not the post
+ * they scheduled, with nothing in the logs to say so.
+ *
+ * The API and composer both refuse the combination earlier. This exists for
+ * when they don't.
+ */
+describe("requireSingleMedia", () => {
+  const item = (position: number) => ({
+    id: `m${position}`,
+    scheduledPostId: "p1",
+    position,
+    storageKey: `ws1/clip${position}.mp4`,
+    mimeType: "video/mp4",
+    // BigInt(...) not 1024n — tsconfig targets below ES2020.
+    sizeBytes: BigInt(1024),
+    kind: "VIDEO" as const,
+    widthPx: null,
+    heightPx: null,
+    durationMs: null,
+    croppedToRatio: null,
+    createdAt: new Date(),
+  });
+
+  it("returns the only item when there is exactly one", () => {
+    const post = { media: [item(0)] } as never;
+    expect(requireSingleMedia(post).storageKey).toBe("ws1/clip0.mp4");
+  });
+
+  it("refuses a carousel rather than silently publishing its first item", () => {
+    const post = { media: [item(0), item(1), item(2)] } as never;
+
+    expect(() => requireSingleMedia(post)).toThrow(PublishError);
+    // The message has to name the real problem — this surfaces in the
+    // dashboard as the reason the post failed.
+    expect(() => requireSingleMedia(post)).toThrow(/single file/);
+  });
+
+  it("refuses a post with no media at all", () => {
+    expect(() => requireSingleMedia({ media: [] } as never)).toThrow(
+      /no media/
+    );
+  });
+
+  it("treats the failure as permanent, since a retry cannot fix it", () => {
+    try {
+      requireSingleMedia({ media: [item(0), item(1)] } as never);
+      expect.unreachable("should have thrown");
+    } catch (error) {
+      expect((error as PublishError).retryable).toBe(false);
+    }
+  });
+});
+
+describe("media shape per post type", () => {
+  it("lets only a carousel hold more than one file", () => {
+    for (const [type, shape] of Object.entries(MEDIA_SHAPE_BY_POST_TYPE)) {
+      if (type === "CAROUSEL") {
+        expect(shape.maxItems).toBe(10);
+        expect(shape.minItems).toBe(2);
+      } else {
+        expect(shape.minItems).toBe(1);
+        expect(shape.maxItems).toBe(1);
+      }
+    }
+  });
+
+  it("only lets Instagram post types accept a still image", () => {
+    const stillCapable = Object.entries(MEDIA_SHAPE_BY_POST_TYPE)
+      .filter(([, shape]) => shape.kinds.includes("IMAGE"))
+      .map(([type]) => type);
+
+    expect(stillCapable.sort()).toEqual(["CAROUSEL", "IMAGE"]);
+    // ...and both of those belong to Instagram alone.
+    for (const type of stillCapable) {
+      expect(MEDIA_TYPE_BY_PLATFORM.INSTAGRAM).toContain(type);
+    }
+  });
+
+  it("covers every post type the platform map can produce", () => {
+    for (const types of Object.values(MEDIA_TYPE_BY_PLATFORM)) {
+      for (const type of types) {
+        expect(MEDIA_SHAPE_BY_POST_TYPE[type]).toBeDefined();
+      }
+    }
   });
 });

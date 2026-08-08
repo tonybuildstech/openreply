@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
+import type {
+  ScheduledPostMedia,
+  ScheduledPostMediaKind,
+} from "@/app/generated/prisma/client";
 import { prisma } from "@/lib/db/client";
 import { getPublishQueue } from "@/lib/queue/client";
 import { getAdapter } from "@/lib/scheduler/adapters";
@@ -14,7 +18,7 @@ import {
   type EditableField,
 } from "@/lib/scheduler/editing";
 import { MEDIA_TYPE_BY_PLATFORM } from "@/lib/scheduler/types";
-import { getMediaStorage } from "@/lib/storage";
+import { getMediaStorage, mediaKindFor } from "@/lib/storage";
 import {
   canManageWorkspace,
   getCurrentWorkspaceContext,
@@ -50,6 +54,46 @@ const patchSchema = z
     "mediaStorageKey and mediaMimeType must be sent together"
   );
 
+interface NewMediaItem {
+  position: number;
+  storageKey: string;
+  mimeType: string;
+  sizeBytes: bigint;
+  kind: ScheduledPostMediaKind;
+}
+
+/** BigInt does not survive JSON.stringify, and every item carries one. */
+function serialiseMedia(media: ScheduledPostMedia[]) {
+  return media.map((item) => ({
+    ...item,
+    sizeBytes: Number(item.sizeBytes),
+  }));
+}
+
+/**
+ * Bin stored files that no post references any more.
+ *
+ * The reference count is what makes this safe: one composer submission fans out
+ * to N posts that all point at the SAME storage key, so deleting eagerly when
+ * one of them changes would break its siblings. Called after the row change has
+ * committed, so the count reflects reality.
+ *
+ * Failures are swallowed — an orphaned file wastes disk, but a 500 here would
+ * fail an edit or delete that already succeeded.
+ */
+async function deleteOrphanedMedia(keys: string[]): Promise<void> {
+  const storage = getMediaStorage();
+
+  for (const key of new Set(keys)) {
+    const stillReferenced = await prisma.scheduledPostMedia.count({
+      where: { storageKey: key },
+    });
+    if (stillReferenced === 0) {
+      await storage.delete(key).catch(() => {});
+    }
+  }
+}
+
 /** One post plus what may still be changed about it. */
 export async function GET(
   _request: NextRequest,
@@ -78,6 +122,7 @@ export async function GET(
           metadata: true,
         },
       },
+      media: { orderBy: { position: "asc" } },
     },
   });
 
@@ -96,8 +141,7 @@ export async function GET(
     success: true,
     data: {
       ...post,
-      // BigInt does not survive JSON.stringify.
-      mediaSizeBytes: Number(post.mediaSizeBytes),
+      media: serialiseMedia(post.media),
       connectedAccount: {
         ...post.connectedAccount,
         metadata: undefined,
@@ -147,7 +191,10 @@ export async function PATCH(
 
   const post = await prisma.scheduledPost.findFirst({
     where: { id, workspaceId: context.workspaceId },
-    include: { connectedAccount: true },
+    include: {
+      connectedAccount: true,
+      media: { orderBy: { position: "asc" } },
+    },
   });
 
   if (!post) {
@@ -208,14 +255,18 @@ export async function PATCH(
     );
   }
 
-  // New file: trust storage for the real size, not the client.
-  let mediaSizeBytes = post.mediaSizeBytes;
-  let mediaMimeType = post.mediaMimeType;
+  // New file: trust storage for the real size and kind, not the client.
+  let replacementMedia: NewMediaItem | null = null;
   if (body.mediaStorageKey && body.mediaMimeType) {
     try {
       const stat = await getMediaStorage().stat(body.mediaStorageKey);
-      mediaSizeBytes = BigInt(stat.size);
-      mediaMimeType = body.mediaMimeType;
+      replacementMedia = {
+        position: 0,
+        storageKey: body.mediaStorageKey,
+        mimeType: body.mediaMimeType,
+        sizeBytes: BigInt(stat.size),
+        kind: mediaKindFor(body.mediaMimeType),
+      };
     } catch {
       return NextResponse.json(
         { success: false, error: "Uploaded media not found — upload it again" },
@@ -224,8 +275,8 @@ export async function PATCH(
     }
 
     const mediaIssue = validateMediaForPlatform(platform, {
-      mimeType: mediaMimeType,
-      sizeBytes: Number(mediaSizeBytes),
+      mimeType: replacementMedia.mimeType,
+      sizeBytes: Number(replacementMedia.sizeBytes),
     });
     if (mediaIssue) {
       return NextResponse.json(
@@ -242,9 +293,6 @@ export async function PATCH(
     platformOptions: (body.platformOptions ??
       post.platformOptions ??
       {}) as object,
-    mediaStorageKey: body.mediaStorageKey ?? post.mediaStorageKey,
-    mediaMimeType,
-    mediaSizeBytes,
   };
 
   // Tell the platform BEFORE committing, when it already holds the post. On
@@ -263,7 +311,18 @@ export async function PATCH(
     }
 
     try {
-      await adapter.update({ ...post, ...updates }, post.connectedAccount);
+      // The adapter sees the post as it WILL be, media included — a remote
+      // edit that read the old caption would push the wrong thing.
+      await adapter.update(
+        {
+          ...post,
+          ...updates,
+          media: replacementMedia
+            ? [{ ...post.media[0], ...replacementMedia }]
+            : post.media,
+        },
+        post.connectedAccount
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
       return NextResponse.json(
@@ -276,7 +335,7 @@ export async function PATCH(
     }
   }
 
-  const previousMediaKey = post.mediaStorageKey;
+  const previousMediaKeys = post.media.map((item) => item.storageKey);
   const updated = await prisma.scheduledPost.update({
     where: { id: post.id },
     data: {
@@ -285,7 +344,14 @@ export async function PATCH(
       ...(post.status === "FAILED" || post.status === "CANCELED"
         ? { status: "QUEUED" as const, lastError: null, attemptCount: 0 }
         : {}),
+      // Swapping the file replaces the whole ordered set rather than editing
+      // rows in place: positions must stay contiguous, and deleteMany +
+      // create inside one update is atomic.
+      ...(replacementMedia
+        ? { media: { deleteMany: {}, create: [replacementMedia] } }
+        : {}),
     },
+    include: { media: { orderBy: { position: "asc" } } },
   });
 
   await prisma.publishJobLog.create({
@@ -297,25 +363,15 @@ export async function PATCH(
     },
   });
 
-  // Only bin the old file once nothing else points at it. Fan-out siblings
-  // share a mediaStorageKey, so deleting eagerly would break the other posts in
-  // the batch.
-  if (body.mediaStorageKey && body.mediaStorageKey !== previousMediaKey) {
-    const stillReferenced = await prisma.scheduledPost.count({
-      where: { mediaStorageKey: previousMediaKey },
-    });
-    if (stillReferenced === 0) {
-      await getMediaStorage()
-        .delete(previousMediaKey)
-        .catch(() => {});
-    }
+  if (replacementMedia) {
+    await deleteOrphanedMedia(previousMediaKeys);
   }
 
   return NextResponse.json({
     success: true,
     data: {
       ...updated,
-      mediaSizeBytes: Number(updated.mediaSizeBytes),
+      media: serialiseMedia(updated.media),
       syncedToPlatform: policy.requiresPlatformSync,
     },
   });
@@ -359,7 +415,10 @@ export async function POST(
 
   const post = await prisma.scheduledPost.findFirst({
     where: { id, workspaceId: context.workspaceId },
-    include: { connectedAccount: true },
+    include: {
+      connectedAccount: true,
+      media: { orderBy: { position: "asc" } },
+    },
   });
 
   if (!post) {
@@ -473,7 +532,11 @@ export async function DELETE(
 
   const post = await prisma.scheduledPost.findFirst({
     where: { id, workspaceId: context.workspaceId },
-    select: { id: true, status: true },
+    select: {
+      id: true,
+      status: true,
+      media: { select: { storageKey: true } },
+    },
   });
 
   if (!post) {
@@ -496,7 +559,11 @@ export async function DELETE(
   await getPublishQueue()
     .remove(`publish_${post.id}`)
     .catch(() => {});
+  // Cascade takes this post's ScheduledPostMedia rows with it, which is what
+  // makes the reference count below correct: it now sees only OTHER posts.
   await prisma.scheduledPost.delete({ where: { id: post.id } });
+
+  await deleteOrphanedMedia(post.media.map((item) => item.storageKey));
 
   return NextResponse.json({ success: true });
 }

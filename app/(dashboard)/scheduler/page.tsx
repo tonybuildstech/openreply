@@ -112,6 +112,36 @@ export default function SchedulerPage() {
     void load();
   }
 
+  /**
+   * Offered on failed posts, which are otherwise stuck in the list forever:
+   * retrying is not always wanted and cancelling a post that already failed
+   * says nothing. This drops the record and its video for good.
+   */
+  async function remove(post: ScheduledPost) {
+    if (
+      !confirm(
+        "Delete this failed post? The record and its uploaded video are removed for good."
+      )
+    ) {
+      return;
+    }
+
+    setBusy(post.id);
+    setActionError(null);
+
+    const res = await fetch(`/api/scheduler/posts/${post.id}`, {
+      method: "DELETE",
+    });
+    const payload = await res.json().catch(() => ({ success: false }));
+
+    setBusy(null);
+    if (!payload.success) {
+      setActionError(payload.error ?? "Could not delete that post");
+      return;
+    }
+    void load();
+  }
+
   const grouped = posts.reduce<Record<string, ScheduledPost[]>>((acc, post) => {
     const key = dayKey(post.scheduledAt);
     (acc[key] ??= []).push(post);
@@ -295,6 +325,15 @@ export default function SchedulerPage() {
                             className="text-xs transition hover:underline disabled:opacity-50"
                           >
                             Retry
+                          </button>
+                        )}
+                        {post.status === "FAILED" && (
+                          <button
+                            onClick={() => void remove(post)}
+                            disabled={busy === post.id}
+                            className="text-xs text-muted transition hover:text-error disabled:opacity-50"
+                          >
+                            Delete
                           </button>
                         )}
                       </div>

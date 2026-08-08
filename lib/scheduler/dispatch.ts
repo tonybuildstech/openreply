@@ -48,7 +48,13 @@ export async function dispatchScheduledPost(
 ): Promise<DispatchOutcome> {
   const post = await prisma.scheduledPost.findUnique({
     where: { id: scheduledPostId },
-    include: { connectedAccount: true },
+    include: {
+      connectedAccount: true,
+      // Ordered here and nowhere else: `position` IS the carousel order the
+      // user chose, and Instagram renders children in the order we list them.
+      // An unordered fetch would silently shuffle a carousel.
+      media: { orderBy: { position: "asc" } },
+    },
   });
 
   if (!post) {

@@ -79,8 +79,16 @@ function uploadComplete(): Response {
 
 const post = {
   caption: "a caption",
-  mediaStorageKey: "ws1/clip.mp4",
-  mediaMimeType: "video/mp4",
+  // One media row at position 0 — the shape every post has had since the
+  // ScheduledPostMedia migration. Adapters read storage keys from here.
+  media: [
+    {
+      position: 0,
+      storageKey: "ws1/clip.mp4",
+      mimeType: "video/mp4",
+      kind: "VIDEO",
+    },
+  ],
   scheduledAt: new Date("2026-09-01T12:00:00.000Z"),
   platformOptions: { title: "Test short" },
 } as never;

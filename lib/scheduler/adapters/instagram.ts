@@ -6,51 +6,74 @@
  * Meta's product marketing page applies to other flows). Our worker fires this
  * at the scheduled minute.
  *
- * Flow (research 2026-08-06):
+ * Flow:
  *   1. POST graph.instagram.com/{v}/{ig-user-id}/media
- *        ?media_type=REELS&upload_type=resumable          → container id
- *   2. POST rupload.facebook.com/ig-api-upload/{v}/{container-id}
- *        Authorization: OAuth <token>, offset, file_size  → raw bytes
- *   3. GET  graph.instagram.com/{v}/{container-id}?fields=status_code
- *        poll until FINISHED
- *   4. POST graph.instagram.com/{v}/{ig-user-id}/media_publish
+ *        ?media_type=REELS&video_url=<signed public url>  → container id
+ *   2. GET  graph.instagram.com/{v}/{container-id}?fields=status_code
+ *        poll until FINISHED — Meta downloads our URL during this window
+ *   3. POST graph.instagram.com/{v}/{ig-user-id}/media_publish
  *        creation_id=<container-id>                        → media id
+ *
+ * **Why `video_url` and not the documented binary upload.** The 2026-08-06
+ * research settled on `upload_type=resumable` + a raw-bytes POST to
+ * `rupload.facebook.com`, which is what Meta's reference describes. It does not
+ * work on `graph.instagram.com`: the parameter is silently ignored and the
+ * endpoint falls through to the URL-pull path, answering
+ * `The parameter video_url is required` (IGApiException 100). Verified against
+ * a live Instagram-Login account on v21.0, v22.0, v23.0, v24.0 and v25.0, with
+ * the params in the query string and in the body, against both `/{ig-user-id}`
+ * and `/me` — same error every time. The same request with `video_url` returns
+ * a container ID. So Meta fetches the file from us instead; see
+ * `lib/storage/public-url.ts` for how that URL is secured.
  *
  * Requires `instagram_business_content_publish` — a separate App Review from
  * the messaging scopes this app already holds.
  */
 
-import type {
-  ConnectedAccount,
-  ScheduledPost,
-} from "@/app/generated/prisma/client";
+import type { ConnectedAccount } from "@/app/generated/prisma/client";
 import { getMetaGraphApiVersion } from "@/lib/env";
 import {
   fetchWithTimeout,
   logMetaUsageHeaders,
   toResponseSnippet,
 } from "@/lib/scheduler/http";
-import { getMediaStorage } from "@/lib/storage";
+import { buildSignedMediaUrl } from "@/lib/storage/public-url";
 import { resolveAccessToken } from "@/lib/scheduler/tokens";
-import { PublishError, type PublishAdapter } from "@/lib/scheduler/types";
+import {
+  PublishError,
+  requireSingleMedia,
+  type PublishAdapter,
+  type ScheduledPostWithMedia,
+} from "@/lib/scheduler/types";
 
 const CONTAINER_POLL_INTERVAL_MS = 6_000;
-// Meta documents no processing SLA. Ten minutes is our own ceiling: long enough
-// for a 90-second Reel, short enough that a stuck container frees the worker.
+// Meta documents no processing SLA, and this window now also covers Meta
+// downloading the file from us. Ten minutes is our own ceiling: long enough for
+// a 90-second Reel, short enough that a stuck container frees the worker.
 const CONTAINER_POLL_TIMEOUT_MS = 10 * 60_000;
 
 function graphBase(): string {
   return `https://graph.instagram.com/${getMetaGraphApiVersion()}`;
 }
 
-function ruploadBase(): string {
-  return `https://rupload.facebook.com/ig-api-upload/${getMetaGraphApiVersion()}`;
-}
-
+/**
+ * Reels container options.
+ *
+ * **Four of these are unverified on this host.** `audioName`, `collaborators`,
+ * `locationId` and `userTags` are documented only against `graph.facebook.com`
+ * (Facebook Login); Meta's Instagram-Login content-publishing guide never
+ * mentions them (research 2026-08-08). Given that `upload_type=resumable` is
+ * likewise documented and silently ignored here, they may be doing nothing.
+ *
+ * They are left in place rather than removed on suspicion — but do not treat
+ * them as working until `.dev/probe-ig-params.ts` says so. The composer
+ * presents all four as real settings.
+ */
 interface InstagramOptions {
   shareToFeed?: boolean;
   coverUrl?: string;
   thumbOffset?: number;
+  /** NOT a music selector — at most renames the "Original audio" label. */
   audioName?: string;
   collaborators?: string;
   locationId?: string;
@@ -115,9 +138,32 @@ async function metaRequest(
 }
 
 /**
+ * Fallback cap, used only when Instagram does not tell us its own number.
+ *
+ * Documented as 50 published items per rolling 24 hours per account, with a
+ * carousel counting as ONE regardless of how many children it has (research
+ * 2026-08-08). This was 25 until that run — see the note on the response shape
+ * below for why the wrong value was reaching this code.
+ */
+const FALLBACK_DAILY_PUBLISH_CAP = 50;
+
+interface ContentPublishingLimitRow {
+  quota_usage?: number;
+  config?: { quota_total?: number; quota_duration?: number };
+}
+
+/**
  * Instagram's own view of the account's rolling-24h publish budget. We ask
  * rather than hardcode, because Meta's documented cap has moved and their docs
  * have disagreed with each other about it.
+ *
+ * **The limit is nested under `config`, not top-level.** The response is
+ * `{ data: [{ quota_usage, config: { quota_total, quota_duration } }] }` —
+ * there is no `quota_limit` field, which is what this code asked for until
+ * 2026-08-08. The effect was quiet and wrong in the expensive direction: the
+ * read always fell through to its default of 25, so between 25 and 50 posts in
+ * a day this threw `retryable`, and the worker requeued posts Instagram would
+ * have accepted.
  */
 async function assertPublishingHeadroom(
   igUserId: string,
@@ -125,7 +171,7 @@ async function assertPublishingHeadroom(
 ): Promise<void> {
   const url =
     `${graphBase()}/${igUserId}/content_publishing_limit` +
-    `?fields=quota_usage,quota_limit&access_token=${encodeURIComponent(accessPlaintextToken)}`;
+    `?fields=quota_usage,config&access_token=${encodeURIComponent(accessPlaintextToken)}`;
 
   let body: Record<string, unknown>;
   try {
@@ -136,11 +182,11 @@ async function assertPublishingHeadroom(
     return;
   }
 
-  const row = (body.data as Array<{ quota_usage?: number; quota_limit?: number }>)?.[0];
+  const row = (body.data as ContentPublishingLimitRow[] | undefined)?.[0];
   if (!row) return;
 
   const usage = row.quota_usage ?? 0;
-  const limit = row.quota_limit ?? 25;
+  const limit = row.config?.quota_total ?? FALLBACK_DAILY_PUBLISH_CAP;
 
   if (usage >= limit) {
     // Requeue-worthy: the window rolls forward, so this genuinely succeeds later.
@@ -152,15 +198,32 @@ async function assertPublishingHeadroom(
 }
 
 async function createContainer(
-  post: ScheduledPost,
+  post: ScheduledPostWithMedia,
   igUserId: string,
   accessPlaintextToken: string
 ): Promise<string> {
   const options = (post.platformOptions ?? {}) as InstagramOptions;
+  // Reels are one video. IMAGE and CAROUSEL posts get their own paths in a
+  // follow-up step; until then this adapter still only publishes REEL, and
+  // refuses anything multi-item rather than publishing part of it.
+  const media = requireSingleMedia(post);
+
+  // Thrown before we touch Meta when the deployment has no public HTTPS base
+  // URL — a `localhost` video_url would only surface ten minutes later as an
+  // unexplained container ERROR.
+  let videoUrl: string;
+  try {
+    videoUrl = buildSignedMediaUrl(media.storageKey);
+  } catch (error) {
+    throw new PublishError(
+      error instanceof Error ? error.message : "Cannot build a public video URL",
+      false
+    );
+  }
 
   const params = new URLSearchParams({
     media_type: "REELS",
-    upload_type: "resumable",
+    video_url: videoUrl,
     access_token: accessPlaintextToken,
   });
   if (post.caption) params.set("caption", post.caption);
@@ -203,44 +266,6 @@ async function createContainer(
   return containerId;
 }
 
-async function uploadBinary(
-  post: ScheduledPost,
-  containerId: string,
-  accessPlaintextToken: string
-): Promise<void> {
-  const storage = getMediaStorage();
-  const { size } = await storage.stat(post.mediaStorageKey);
-
-  // Streamed from disk — the worker runs under a 250 MB RSS cap and these
-  // files can be a gigabyte.
-  const stream = storage.createReadStream(post.mediaStorageKey);
-
-  const response = await fetchWithTimeout(`${ruploadBase()}/${containerId}`, {
-    method: "POST",
-    headers: {
-      Authorization: `OAuth ${accessPlaintextToken}`,
-      offset: "0",
-      // Documented alongside `offset` for the Reels rupload flow. Meta's IG
-      // reference is truncated here, so this one is verify-on-first-run.
-      file_size: String(size),
-      "Content-Type": "application/octet-stream",
-    },
-    body: stream as unknown as BodyInit,
-    // Node requires this when streaming a request body.
-    duplex: "half",
-    timeoutMs: 30 * 60_000,
-  } as RequestInit & { duplex: "half"; timeoutMs: number });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new PublishError(
-      `Instagram upload failed (HTTP ${response.status})`,
-      response.status >= 500 || response.status === 429,
-      { responseSnippet: toResponseSnippet(text) }
-    );
-  }
-}
-
 async function waitForContainer(
   containerId: string,
   accessPlaintextToken: string
@@ -262,7 +287,7 @@ async function waitForContainer(
       // Documented as terminal. The container cannot be reused; a retry must
       // start from a fresh container, which is what the worker's retry does.
       throw new PublishError(
-        "Instagram could not process this video. Check that it meets Reels requirements (MP4, 3–90s, vertical).",
+        "Instagram could not process this video. Either it does not meet Reels requirements (MP4, 3–90s, vertical), or Instagram could not download it from this server.",
         false,
         { responseSnippet: toResponseSnippet(body) }
       );
@@ -295,7 +320,7 @@ export const instagramAdapter: PublishAdapter = {
   platform: "INSTAGRAM",
   dispatchMode: "QUEUED",
 
-  async schedule(post: ScheduledPost, account: ConnectedAccount) {
+  async schedule(post: ScheduledPostWithMedia, account: ConnectedAccount) {
     const accessPlaintextToken = await resolveAccessToken(account);
     const igUserId = account.platformAccountId;
 
@@ -306,7 +331,6 @@ export const instagramAdapter: PublishAdapter = {
       igUserId,
       accessPlaintextToken
     );
-    await uploadBinary(post, containerId, accessPlaintextToken);
     await waitForContainer(containerId, accessPlaintextToken);
 
     const published = await metaRequest(

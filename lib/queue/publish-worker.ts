@@ -125,7 +125,10 @@ export async function reconcileRemoteStatuses(): Promise<void> {
       // Only worth asking once the scheduled moment has actually passed.
       scheduledAt: { lte: new Date() },
     },
-    include: { connectedAccount: true },
+    include: {
+      connectedAccount: true,
+      media: { orderBy: { position: "asc" } },
+    },
     take: 20,
     orderBy: { scheduledAt: "asc" },
   });

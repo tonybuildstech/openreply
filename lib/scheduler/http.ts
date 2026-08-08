@@ -22,6 +22,9 @@ const SECRET_PATTERNS: RegExp[] = [
   /ya29\.[A-Za-z0-9._-]+/g,
   // TikTok upload URLs carry an upload_token
   /(upload_token=)[^&\s"']+/gi,
+  // Our own signed media URLs (lib/storage/public-url.ts). The path IS the
+  // credential, and Meta echoes the failing video_url straight back at us.
+  /(\/api\/media\/public\/)[^\s"'<>]+/g,
 ];
 
 export function scrubSecrets(input: string): string {

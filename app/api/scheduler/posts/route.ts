@@ -11,7 +11,7 @@ import {
 } from "@/lib/scheduler/constraints";
 import { getYouTubeQuotaState } from "@/lib/scheduler/quota";
 import { MEDIA_TYPE_BY_PLATFORM } from "@/lib/scheduler/types";
-import { getMediaStorage } from "@/lib/storage";
+import { getMediaStorage, mediaKindFor } from "@/lib/storage";
 import {
   canManageWorkspace,
   getCurrentWorkspaceContext,
@@ -69,6 +69,9 @@ export async function GET(request: NextRequest) {
           status: true,
         },
       },
+      // The calendar shows a thumbnail per post, and a carousel's first item
+      // is the one it shows — so order matters even in the list view.
+      media: { orderBy: { position: "asc" } },
     },
   });
 
@@ -76,8 +79,11 @@ export async function GET(request: NextRequest) {
     success: true,
     data: posts.map((post) => ({
       ...post,
-      // BigInt does not survive JSON.stringify.
-      mediaSizeBytes: Number(post.mediaSizeBytes),
+      // BigInt does not survive JSON.stringify, and every item carries one.
+      media: post.media.map((item) => ({
+        ...item,
+        sizeBytes: Number(item.sizeBytes),
+      })),
     })),
   });
 }
@@ -230,15 +236,27 @@ export async function POST(request: NextRequest) {
         data: {
           workspaceId: context.workspaceId,
           connectedAccountId: target.connectedAccountId,
-          mediaStorageKey,
-          mediaMimeType,
-          mediaSizeBytes: BigInt(mediaSize),
           mediaType: target.mediaType,
           caption: target.caption ?? caption,
           platformOptions: (target.platformOptions ?? {}) as object,
           scheduledAt,
           status: "QUEUED",
           batchId,
+          // One item at position 0. The fan-out targets deliberately SHARE a
+          // storage key — the file is uploaded once and every platform reads
+          // the same bytes, which is why deleting one post's media checks for
+          // other references first.
+          media: {
+            create: [
+              {
+                position: 0,
+                storageKey: mediaStorageKey,
+                mimeType: mediaMimeType,
+                sizeBytes: BigInt(mediaSize),
+                kind: mediaKindFor(mediaMimeType),
+              },
+            ],
+          },
         },
       })
     )

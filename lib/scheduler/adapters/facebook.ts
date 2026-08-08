@@ -21,6 +21,7 @@
 import type {
   ConnectedAccount,
   ScheduledPost,
+  ScheduledPostMedia,
 } from "@/app/generated/prisma/client";
 import { getMetaGraphApiVersion, requireEnv } from "@/lib/env";
 import {
@@ -30,7 +31,12 @@ import {
 } from "@/lib/scheduler/http";
 import { recordQuotaUsage } from "@/lib/scheduler/quota";
 import { resolveAccessToken } from "@/lib/scheduler/tokens";
-import { PublishError, type PublishAdapter } from "@/lib/scheduler/types";
+import {
+  PublishError,
+  requireSingleMedia,
+  type PublishAdapter,
+  type ScheduledPostWithMedia,
+} from "@/lib/scheduler/types";
 import { getMediaStorage } from "@/lib/storage";
 
 function graphBase(): string {
@@ -82,6 +88,7 @@ function toUnixSeconds(date: Date): string {
 
 async function publishReel(
   post: ScheduledPost,
+  media: ScheduledPostMedia,
   account: ConnectedAccount,
   accessPlaintextToken: string
 ) {
@@ -111,8 +118,8 @@ async function publishReel(
   }
 
   const storage = getMediaStorage();
-  const { size } = await storage.stat(post.mediaStorageKey);
-  const stream = storage.createReadStream(post.mediaStorageKey);
+  const { size } = await storage.stat(media.storageKey);
+  const stream = storage.createReadStream(media.storageKey);
 
   const uploadResponse = await fetchWithTimeout(uploadUrl, {
     method: "POST",
@@ -160,20 +167,21 @@ async function publishReel(
 
 async function publishFeedVideo(
   post: ScheduledPost,
+  media: ScheduledPostMedia,
   account: ConnectedAccount,
   accessPlaintextToken: string
 ) {
   const pageId = account.platformAccountId;
   const appId = requireEnv("FACEBOOK_APP_ID");
   const storage = getMediaStorage();
-  const { size } = await storage.stat(post.mediaStorageKey);
+  const { size } = await storage.stat(media.storageKey);
 
   const session = await metaRequest(
     `${graphBase()}/${appId}/uploads?` +
       new URLSearchParams({
-        file_name: post.mediaStorageKey.split("/").pop() ?? "video.mp4",
+        file_name: media.storageKey.split("/").pop() ?? "video.mp4",
         file_length: String(size),
-        file_type: post.mediaMimeType,
+        file_type: media.mimeType,
         access_token: accessPlaintextToken,
       }).toString(),
     { method: "POST" },
@@ -189,7 +197,7 @@ async function publishFeedVideo(
     );
   }
 
-  const stream = storage.createReadStream(post.mediaStorageKey);
+  const stream = storage.createReadStream(media.storageKey);
   const transfer = await fetchWithTimeout(`${graphBase()}/${sessionId}`, {
     method: "POST",
     headers: {
@@ -245,13 +253,16 @@ export const facebookAdapter: PublishAdapter = {
   platform: "FACEBOOK_PAGE",
   dispatchMode: "NATIVE",
 
-  async schedule(post: ScheduledPost, account: ConnectedAccount) {
+  async schedule(post: ScheduledPostWithMedia, account: ConnectedAccount) {
     const accessPlaintextToken = await resolveAccessToken(account);
+    // Facebook publishes one video per post. Throws on a carousel rather than
+    // silently sending its first item.
+    const media = requireSingleMedia(post);
 
     const { videoId } =
       post.mediaType === "FACEBOOK_REEL"
-        ? await publishReel(post, account, accessPlaintextToken)
-        : await publishFeedVideo(post, account, accessPlaintextToken);
+        ? await publishReel(post, media, account, accessPlaintextToken)
+        : await publishFeedVideo(post, media, account, accessPlaintextToken);
 
     if (post.mediaType === "FACEBOOK_REEL") {
       // Documented hard cap: 30 API-published Reels per rolling 24 hours,
@@ -280,7 +291,7 @@ export const facebookAdapter: PublishAdapter = {
    * the error, so the caller leaves our row untouched instead of recording an
    * edit Facebook never accepted.
    */
-  async update(post: ScheduledPost, account: ConnectedAccount) {
+  async update(post: ScheduledPostWithMedia, account: ConnectedAccount) {
     if (!post.platformPostId) {
       throw new PublishError(
         "This Facebook post has no ID recorded, so it cannot be edited",
@@ -307,7 +318,7 @@ export const facebookAdapter: PublishAdapter = {
     );
   },
 
-  async cancel(post: ScheduledPost, account: ConnectedAccount) {
+  async cancel(post: ScheduledPostWithMedia, account: ConnectedAccount) {
     if (!post.platformPostId) return;
 
     const accessPlaintextToken = await resolveAccessToken(account);

@@ -25,6 +25,18 @@ const EXTENSION_BY_MIME: Record<string, string> = {
 export const SUPPORTED_UPLOAD_MIME_TYPES = Object.keys(EXTENSION_BY_MIME);
 
 /**
+ * Whether a stored object is a still or a video.
+ *
+ * Always derived from the content type the storage layer recorded — never from
+ * anything the client sent. A client that could declare its own `kind` could
+ * claim a video is an image and route it down Instagram's `image_url` path,
+ * where the failure surfaces as an opaque container ERROR ten minutes later.
+ */
+export function mediaKindFor(mimeType: string): "IMAGE" | "VIDEO" {
+  return mimeType.toLowerCase().startsWith("image/") ? "IMAGE" : "VIDEO";
+}
+
+/**
  * Keys are `{workspaceId}/{yyyy}/{mm}/{uuid}{ext}` — sharded by month so a
  * single directory never accumulates unbounded entries, and prefixed by
  * workspace so a whole workspace's media can be removed with one recursive

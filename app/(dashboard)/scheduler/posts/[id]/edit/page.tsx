@@ -36,9 +36,18 @@ interface EditablePost {
   scheduledAt: string;
   status: keyof typeof POST_STATUS_LABELS;
   platformOptions: TargetOptions | null;
-  mediaStorageKey: string;
-  mediaMimeType: string;
-  mediaSizeBytes: number;
+  /**
+   * Ordered by carousel position. Always at least one item; only Instagram
+   * carousels have more than one, and this page edits the first — replacing a
+   * whole carousel from here is not supported yet.
+   */
+  media: Array<{
+    position: number;
+    storageKey: string;
+    mimeType: string;
+    sizeBytes: number;
+    kind: "IMAGE" | "VIDEO";
+  }>;
   lastError: string | null;
   connectedAccount: {
     id: string;
@@ -186,6 +195,15 @@ export default function EditScheduledPostPage() {
   const status = POST_STATUS_LABELS[post.status] ?? POST_STATUS_LABELS.QUEUED;
   const can = (field: EditableField) => post.policy.editable.includes(field);
   const locked = post.policy.editable.length === 0;
+  // Position 0. Every post has one; the fallback only guards against a row
+  // whose media went missing, which would otherwise crash the whole page.
+  const currentMedia = post.media[0] ?? {
+    position: 0,
+    storageKey: "(missing)",
+    mimeType: "unknown",
+    sizeBytes: 0,
+    kind: "VIDEO" as const,
+  };
 
   return (
     <div className="max-w-3xl space-y-5 pb-12">
@@ -246,16 +264,22 @@ export default function EditScheduledPostPage() {
                   ? newMedia.filename
                     ? decodeURIComponent(newMedia.filename)
                     : "New video"
-                  : post.mediaStorageKey.split("/").pop()}
+                  : currentMedia.storageKey.split("/").pop()}
               </p>
               <p className="mt-0.5 text-xs text-muted">
                 {(
-                  (newMedia?.sizeBytes ?? post.mediaSizeBytes) /
+                  (newMedia?.sizeBytes ?? currentMedia.sizeBytes) /
                   1024 ** 2
                 ).toFixed(1)}{" "}
-                MB · {newMedia?.mimeType ?? post.mediaMimeType}
+                MB · {newMedia?.mimeType ?? currentMedia.mimeType}
                 {newMedia && " · replaces the current file when you save"}
               </p>
+              {post.media.length > 1 && (
+                <p className="mt-1 text-xs text-warning">
+                  This post has {post.media.length} items. Only the first is
+                  shown here — editing the file replaces the whole set.
+                </p>
+              )}
             </div>
 
             {can("media") ? (

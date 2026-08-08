@@ -42,14 +42,18 @@ export const PLATFORM_CONSTRAINTS: Record<SocialPlatform, PlatformConstraints> =
       maxDurationSeconds: 90,
       maxFileBytes: 1 * GB,
       maxFrameRate: 60,
-      dailyPostCap: 25,
+      // Documented at 50 per rolling 24h per account (research 2026-08-08); was
+      // 25 here, which disagreed with Meta's own guide. A carousel counts as
+      // ONE published item however many children it has — worth saying in the
+      // note below once the composer can actually build one.
+      dailyPostCap: 50,
       // No native scheduling: our worker fires it. A short lead time is fine,
       // but the upload + container processing needs room before the target.
       minLeadTimeMinutes: 5,
       maxLeadTimeDays: 365,
       notes: [
         "Instagram has no scheduling API — OpenReply's worker publishes this at the scheduled minute.",
-        "Limit: 25 posts per rolling 24 hours, checked against Instagram before each publish.",
+        "Limit: 50 posts per rolling 24 hours, checked against Instagram before each publish.",
       ],
     },
 

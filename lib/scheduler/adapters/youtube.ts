@@ -22,6 +22,7 @@
 import type {
   ConnectedAccount,
   ScheduledPost,
+  ScheduledPostMedia,
 } from "@/app/generated/prisma/client";
 import { fetchWithTimeout, toResponseSnippet } from "@/lib/scheduler/http";
 import {
@@ -31,7 +32,12 @@ import {
   recordQuotaUsage,
 } from "@/lib/scheduler/quota";
 import { resolveAccessToken } from "@/lib/scheduler/tokens";
-import { PublishError, type PublishAdapter } from "@/lib/scheduler/types";
+import {
+  PublishError,
+  requireSingleMedia,
+  type PublishAdapter,
+  type ScheduledPostWithMedia,
+} from "@/lib/scheduler/types";
 import { getMediaStorage } from "@/lib/storage";
 
 const UPLOAD_URL =
@@ -138,6 +144,7 @@ async function googleRequest(
 /** Start a resumable session and return its session URI. */
 async function startSession(
   post: ScheduledPost,
+  media: ScheduledPostMedia,
   account: ConnectedAccount,
   accessPlaintextToken: string,
   sizeBytes: number
@@ -173,7 +180,7 @@ async function startSession(
       Authorization: `Bearer ${accessPlaintextToken}`,
       "Content-Type": "application/json; charset=UTF-8",
       "X-Upload-Content-Length": String(sizeBytes),
-      "X-Upload-Content-Type": post.mediaMimeType,
+      "X-Upload-Content-Type": media.mimeType,
     },
     body: JSON.stringify(metadata),
     timeoutMs: 60_000,
@@ -211,7 +218,7 @@ async function startSession(
  * uploads end up with duplicated or missing bytes.
  */
 async function uploadChunks(
-  post: ScheduledPost,
+  media: ScheduledPostMedia,
   sessionUri: string,
   accessPlaintextToken: string,
   sizeBytes: number
@@ -222,7 +229,7 @@ async function uploadChunks(
 
   while (offset < sizeBytes) {
     const end = Math.min(offset + CHUNK_BYTES, sizeBytes) - 1;
-    const stream = storage.createReadStream(post.mediaStorageKey, {
+    const stream = storage.createReadStream(media.storageKey, {
       start: offset,
       end,
     });
@@ -232,7 +239,7 @@ async function uploadChunks(
       headers: {
         Authorization: `Bearer ${accessPlaintextToken}`,
         "Content-Length": String(end - offset + 1),
-        "Content-Type": post.mediaMimeType,
+        "Content-Type": media.mimeType,
         "Content-Range": `bytes ${offset}-${end}/${sizeBytes}`,
       },
       body: stream as unknown as BodyInit,
@@ -301,7 +308,7 @@ export const youtubeAdapter: PublishAdapter = {
   platform: "YOUTUBE",
   dispatchMode: "NATIVE",
 
-  async schedule(post: ScheduledPost, account: ConnectedAccount) {
+  async schedule(post: ScheduledPostWithMedia, account: ConnectedAccount) {
     const quota = await getYouTubeQuotaState();
     if (!quota.canUpload) {
       // Retryable: tomorrow's UTC reset genuinely fixes this.
@@ -312,17 +319,21 @@ export const youtubeAdapter: PublishAdapter = {
     }
 
     const accessPlaintextToken = await resolveAccessToken(account);
+    // YouTube publishes one video per post. Throws on a carousel rather than
+    // silently sending its first item.
+    const media = requireSingleMedia(post);
     const storage = getMediaStorage();
-    const { size } = await storage.stat(post.mediaStorageKey);
+    const { size } = await storage.stat(media.storageKey);
 
     const sessionUri = await startSession(
       post,
+      media,
       account,
       accessPlaintextToken,
       size
     );
     const video = await uploadChunks(
-      post,
+      media,
       sessionUri,
       accessPlaintextToken,
       size
@@ -348,7 +359,7 @@ export const youtubeAdapter: PublishAdapter = {
     };
   },
 
-  async checkStatus(post: ScheduledPost, account: ConnectedAccount) {
+  async checkStatus(post: ScheduledPostWithMedia, account: ConnectedAccount) {
     if (!post.platformPostId) return "pending";
 
     const accessPlaintextToken = await resolveAccessToken(account);
@@ -383,7 +394,7 @@ export const youtubeAdapter: PublishAdapter = {
    * only accepted while the video is private and has never been published,
    * which is exactly the SCHEDULED_REMOTE state and no other.
    */
-  async update(post: ScheduledPost, account: ConnectedAccount) {
+  async update(post: ScheduledPostWithMedia, account: ConnectedAccount) {
     if (!post.platformPostId) {
       throw new PublishError(
         "This YouTube video has no ID recorded, so it cannot be edited",
@@ -432,7 +443,7 @@ export const youtubeAdapter: PublishAdapter = {
     });
   },
 
-  async cancel(post: ScheduledPost, account: ConnectedAccount) {
+  async cancel(post: ScheduledPostWithMedia, account: ConnectedAccount) {
     if (!post.platformPostId) return;
 
     const accessPlaintextToken = await resolveAccessToken(account);

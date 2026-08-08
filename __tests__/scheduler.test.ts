@@ -81,6 +81,22 @@ describe("secret scrubbing", () => {
     ).not.toContain("Xza123");
   });
 
+  it("redacts our own signed media URLs, which Meta echoes back on failure", () => {
+    // The signature in the path is a read capability on the file — it must not
+    // survive into PublishJobLog or the dashboard's error text.
+    const raw = JSON.stringify({
+      error: {
+        message:
+          "Only photo or video can be accepted as media type. video_url=https://openreply.ivanovic.dev/api/media/public/eyJrIjoiYSJ9.s1gnATur3/media.mp4",
+      },
+    });
+    const scrubbed = scrubSecrets(raw);
+
+    expect(scrubbed).not.toContain("s1gnATur3");
+    expect(scrubbed).not.toContain("eyJrIjoiYSJ9");
+    expect(scrubbed).toContain("/api/media/public/[REDACTED]");
+  });
+
   it("truncates snippets so a huge body cannot bloat the log table", () => {
     expect(toResponseSnippet("x".repeat(5000)).length).toBeLessThanOrEqual(500);
   });
@@ -259,9 +275,24 @@ describe("media validation", () => {
   });
 
   it("documents a daily cap for every platform that publishes one", () => {
-    expect(PLATFORM_CONSTRAINTS.INSTAGRAM.dailyPostCap).toBe(25);
+    // Instagram is 50, not the 25 this asserted until 2026-08-08 — Meta's own
+    // content-publishing guide documents 50 per rolling 24h, with a carousel
+    // counting as one. See __tests__/instagram-quota.test.ts for the pre-flight
+    // that reads the account's real number.
+    expect(PLATFORM_CONSTRAINTS.INSTAGRAM.dailyPostCap).toBe(50);
     expect(PLATFORM_CONSTRAINTS.FACEBOOK_PAGE.dailyPostCap).toBe(30);
     expect(PLATFORM_CONSTRAINTS.TIKTOK.dailyPostCap).toBe(15);
+  });
+
+  it("keeps the composer's stated Instagram cap in step with the constraint", () => {
+    // These two drifting apart is how the UI ends up promising a limit the
+    // adapter does not enforce.
+    const cap = PLATFORM_CONSTRAINTS.INSTAGRAM.dailyPostCap;
+    expect(
+      PLATFORM_CONSTRAINTS.INSTAGRAM.notes.some((note) =>
+        note.includes(`${cap} posts per rolling 24 hours`)
+      )
+    ).toBe(true);
   });
 });
 

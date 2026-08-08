@@ -19,10 +19,51 @@
 import type {
   ConnectedAccount,
   ScheduledPost,
+  ScheduledPostMedia,
   SocialPlatform,
 } from "@/app/generated/prisma/client";
 
 export type DispatchMode = "NATIVE" | "QUEUED";
+
+/**
+ * A post with its files attached, in carousel order.
+ *
+ * Adapters are always handed this, never a bare `ScheduledPost` — the media
+ * relation is the only place a storage key lives. `dispatchScheduledPost` is
+ * responsible for loading it ordered by `position`.
+ */
+export type ScheduledPostWithMedia = ScheduledPost & {
+  media: ScheduledPostMedia[];
+};
+
+/**
+ * The single file a one-file platform publishes.
+ *
+ * Only Instagram accepts a carousel. YouTube, TikTok and Facebook take exactly
+ * one video, so this throws rather than quietly publishing item 0 — a user who
+ * scheduled a 5-image carousel to TikTok must be told it cannot work, not
+ * discover later that one arbitrary frame of it went out. The API and composer
+ * both refuse this combination first; this is the backstop for the case where
+ * they don't.
+ */
+export function requireSingleMedia(
+  post: ScheduledPostWithMedia
+): ScheduledPostMedia {
+  const [first] = post.media;
+
+  if (!first) {
+    throw new PublishError("This post has no media attached", false);
+  }
+
+  if (post.media.length > 1) {
+    throw new PublishError(
+      `This platform publishes a single file, but this post has ${post.media.length}. Schedule the carousel to Instagram on its own.`,
+      false
+    );
+  }
+
+  return first;
+}
 
 export interface PublishResult {
   /** The platform's ID for the published or scheduled post, when it gives one. */
@@ -45,13 +86,13 @@ export interface PublishAdapter {
   readonly dispatchMode: DispatchMode;
 
   schedule(
-    post: ScheduledPost,
+    post: ScheduledPostWithMedia,
     account: ConnectedAccount
   ): Promise<PublishResult>;
 
   /** Confirm a post that the platform processes asynchronously. */
   checkStatus?(
-    post: ScheduledPost,
+    post: ScheduledPostWithMedia,
     account: ConnectedAccount
   ): Promise<PublishStatus>;
 
@@ -59,7 +100,10 @@ export interface PublishAdapter {
    * Undo a natively-scheduled post. Without this, deleting our row would leave
    * the platform to publish anyway — so the UI's cancel button depends on it.
    */
-  cancel?(post: ScheduledPost, account: ConnectedAccount): Promise<void>;
+  cancel?(
+    post: ScheduledPostWithMedia,
+    account: ConnectedAccount
+  ): Promise<void>;
 
   /**
    * Push an edit to a post the platform is already holding
@@ -71,7 +115,10 @@ export interface PublishAdapter {
    * straight off it. Implementations must throw rather than partially apply —
    * the caller only commits the row once this resolves.
    */
-  update?(post: ScheduledPost, account: ConnectedAccount): Promise<void>;
+  update?(
+    post: ScheduledPostWithMedia,
+    account: ConnectedAccount
+  ): Promise<void>;
 }
 
 /**
@@ -98,13 +145,34 @@ export class PublishError extends Error {
   }
 }
 
-/** Which media types each platform accepts, for validation at schedule time. */
+/** Which post types each platform accepts, for validation at schedule time. */
 export const MEDIA_TYPE_BY_PLATFORM: Record<
   SocialPlatform,
   ReadonlyArray<ScheduledPost["mediaType"]>
 > = {
-  INSTAGRAM: ["REEL"],
+  INSTAGRAM: ["REEL", "IMAGE", "CAROUSEL"],
   YOUTUBE: ["SHORT"],
   TIKTOK: ["TIKTOK_VIDEO"],
   FACEBOOK_PAGE: ["FACEBOOK_REEL", "FACEBOOK_VIDEO"],
+};
+
+/**
+ * How many files each post type takes, and of what kind.
+ *
+ * Enforced at the API before anything is written, because the alternative is
+ * discovering the mismatch at the scheduled minute. Instagram's carousel bounds
+ * are the platform's: "up to 10 images, videos, or a mix of the two". The
+ * minimum of 2 is ours — Meta documents no floor (see Q14).
+ */
+export const MEDIA_SHAPE_BY_POST_TYPE: Record<
+  ScheduledPost["mediaType"],
+  { minItems: number; maxItems: number; kinds: ReadonlyArray<"IMAGE" | "VIDEO"> }
+> = {
+  REEL: { minItems: 1, maxItems: 1, kinds: ["VIDEO"] },
+  IMAGE: { minItems: 1, maxItems: 1, kinds: ["IMAGE"] },
+  CAROUSEL: { minItems: 2, maxItems: 10, kinds: ["IMAGE", "VIDEO"] },
+  SHORT: { minItems: 1, maxItems: 1, kinds: ["VIDEO"] },
+  TIKTOK_VIDEO: { minItems: 1, maxItems: 1, kinds: ["VIDEO"] },
+  FACEBOOK_REEL: { minItems: 1, maxItems: 1, kinds: ["VIDEO"] },
+  FACEBOOK_VIDEO: { minItems: 1, maxItems: 1, kinds: ["VIDEO"] },
 };
