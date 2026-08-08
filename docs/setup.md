@@ -109,7 +109,7 @@ Optional, for tuning the polling reconciler (defaults are fine to start):
 | --- | --- | --- |
 | `COMMENT_POLL_INTERVAL_MS` | `300000` | How often the worker sweeps for missed comments (5 min). |
 | `COMMENT_POLL_MAX_PER_SWEEP` | `30` | Max new comments each campaign acts on per sweep. Keep it conservative; higher gets closer to Instagram's rate limits. |
-| `COMMENT_POLL_LOOKBACK_HOURS` | `72` | How far back a sweep considers comments. |
+| `COMMENT_POLL_LOOKBACK_HOURS` | `72` | How far back a sweep considers comments. Capped at **168** (7 days) whatever you set: Instagram refuses a private reply to a comment older than that, so looking further back would only produce guaranteed failures. |
 
 ## The Meta app
 
@@ -170,7 +170,7 @@ The first is the one everything normally uses. The second is only reached if you
 
 No trailing slash. If the first is missing or wrong, connecting an account fails with a redirect_uri mismatch. You can register more than one, which is useful if you change domains later; keep the old and new both listed.
 
-You do not need the "Embed URL" that Meta shows here. OpenReply builds its own login URL. Users connect by opening your app, going to Settings, and clicking Connect Instagram.
+You do not need the "Embed URL" that Meta shows here. OpenReply builds its own login URL. Users connect by opening your app, going to Connections, and clicking Connect Instagram.
 
 ### Step 8: Configure the webhook
 
@@ -208,7 +208,7 @@ Meta's `/me` returns two IDs. The `id` field is app-scoped. The `user_id` field 
 ## Test it end to end
 
 1. Make sure the account is a tester and has accepted the invite (Step 6), and the app is published (Step 9).
-2. Connect it in the app: Settings, Connect Instagram. You should reach Instagram's consent screen, not the "Insufficient Developer Role" error.
+2. Connect it in the app: Connections, Connect Instagram. You should reach Instagram's consent screen, not the "Insufficient Developer Role" error.
 3. Create a campaign on one of your posts with a keyword like `TEST`.
 4. From a different Instagram account, comment `TEST` on that post. It must be a different account, because OpenReply ignores your own comments on purpose.
 5. Watch for the DM. If nothing arrives, check the DM Logs page and `/api/health`.
@@ -253,26 +253,28 @@ Publishing needs the `instagram_business_content_publish` permission, which is a
 **separate App Review submission** from the messaging permissions used by comment-to-DM.
 Neither approval depends on the other. Add the permission in your existing Meta app.
 
-You connect Instagram **once**, in Settings. That single authorization requests the
-messaging scopes and the publishing scope together, and the account then appears under
-Scheduler, Connections without consenting again.
+You connect Instagram **once**, on the Connections page. That single authorization
+requests the messaging scopes and the publishing scope together, and the account is then
+listed there with both capabilities without consenting again.
 
 If the publishing permission is not approved on your app yet, a consent screen containing
 it can fail outright — and for non-tester users that would take comment-to-DM down with
 it. Two ways out, in increasing order of bluntness:
 
-- Connect for DMs only, once: `/api/instagram/connect?publish=0`. Settings offers this as
-  a link if a connection comes back refused.
+- Connect for DMs only, once: `/api/instagram/connect?publish=0`. Connections offers this
+  as a link if a connection comes back refused.
 - Set `IG_UNIFIED_CONNECT=0` to make messaging-only the default for everyone. Publishing
-  then gets its own connect button under Scheduler, Connections, exactly as before. This
+  then gets its own connect button on the Connections page, exactly as before. This
   is the right setting for a **multi-tenant instance** where strangers sign up and the
   publishing permission is still pending review.
 
 Both processes should agree on this variable, and remember PM2 does not re-read `.env` on
 its own — a full deploy or an explicit restart is needed for a change to take.
 
-Limit: 25 posts per rolling 24 hours, which OpenReply checks with Instagram before each
-publish.
+Limit: Meta's current docs say **50** API-published posts per rolling 24 hours (carousels
+count as one). Their docs have contradicted themselves on this number, so OpenReply does
+not hardcode it — it asks Instagram's `content_publishing_limit` endpoint before each
+publish and uses whatever quota Instagram reports.
 
 ### Facebook Pages
 

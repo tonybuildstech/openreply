@@ -39,6 +39,13 @@ export interface WebhookCommentEvent {
   commenterId: string;
   commenterName?: string;
   mediaId: string;
+  /**
+   * ISO time the comment was created, used for the 7-day private-reply window.
+   * Instagram's `comments` payload carries no comment timestamp, so this comes
+   * from the entry's delivery time — which for a webhook-delivered comment is
+   * within seconds of creation. Undefined if the entry had no usable time.
+   */
+  commentCreatedAt?: string;
 }
 
 interface WebhookEntry {
@@ -79,6 +86,23 @@ interface WebhookPayload {
   entry: WebhookEntry[];
 }
 
+/**
+ * Meta sends `entry.time` in **seconds**, but has historically sent
+ * milliseconds on some products. Disambiguate by magnitude rather than trusting
+ * either: a seconds value for any plausible date is ~1e9, a milliseconds one
+ * ~1e12. Getting this backwards would date every comment to 1970 and make the
+ * private-reply window check reject everything.
+ */
+function entryTimeToIso(time: number | undefined): string | undefined {
+  if (typeof time !== "number" || !Number.isFinite(time) || time <= 0) {
+    return undefined;
+  }
+
+  const ms = time > 1e11 ? time : time * 1000;
+  const date = new Date(ms);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
 export function parseCommentEvents(payload: WebhookPayload): WebhookCommentEvent[] {
   const events: WebhookCommentEvent[] = [];
 
@@ -113,6 +137,7 @@ export function parseCommentEvents(payload: WebhookPayload): WebhookCommentEvent
         commenterId,
         commenterName: value.from?.username,
         mediaId,
+        commentCreatedAt: entryTimeToIso(entry.time),
       });
     }
   }

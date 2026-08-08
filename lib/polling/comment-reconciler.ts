@@ -34,11 +34,21 @@ import {
   type InstagramComment,
 } from "@/lib/meta/client";
 import { decryptToken } from "@/lib/meta/oauth";
+import { PRIVATE_REPLY_WINDOW_HOURS } from "@/lib/meta/private-reply-window";
 import { matchKeywords } from "@/lib/utils/keyword-matcher";
 
 // Only consider comments from the last few days — older ones are outside
 // Instagram's private-reply window anyway, so a DM to them would just fail.
-const LOOKBACK_HOURS = Number(process.env.COMMENT_POLL_LOOKBACK_HOURS ?? 72);
+//
+// Hard-capped at the window itself: this is operator-configurable, and setting
+// it past 7 days used to enqueue comments that Instagram will refuse to private
+// reply to, producing guaranteed failures and burning hourly rate-limit slots.
+// A campaign that only posts public replies could in principle look back
+// further, but the two legs share this sweep, so the stricter limit governs.
+const LOOKBACK_HOURS = Math.min(
+  Number(process.env.COMMENT_POLL_LOOKBACK_HOURS ?? 72),
+  PRIVATE_REPLY_WINDOW_HOURS
+);
 // Hard cap on how many new comments a single campaign can enqueue per sweep, so
 // a viral post drains gradually instead of bursting into the comment API.
 const MAX_NEW_PER_SWEEP = Number(process.env.COMMENT_POLL_MAX_PER_SWEEP ?? 30);
@@ -237,6 +247,9 @@ async function sweepCampaign(
         commenterId: c.from!.id,
         commenterName: c.from?.username,
         mediaId,
+        // Instagram's own creation time — more trustworthy than the webhook
+        // path's delivery-time approximation, and the sweep already reads it.
+        commentCreatedAt: c.timestamp,
         source: "POLLING",
       });
       stat.enqueued += 1;

@@ -129,7 +129,7 @@ export default function SchedulerPage() {
         </div>
         <div className="flex shrink-0 gap-2">
           <Link
-            href="/scheduler/connections"
+            href="/connections"
             className="rounded-lg border border-border px-3 py-2 text-sm transition hover:bg-surface"
           >
             Connections

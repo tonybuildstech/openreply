@@ -11,7 +11,7 @@
  */
 
 import type { SocialPlatform } from "@/app/generated/prisma/client";
-import { getBaseUrl, requireEnv } from "@/lib/env";
+import { getBaseUrl, getMetaGraphApiVersion, requireEnv } from "@/lib/env";
 import { fetchWithTimeout, toResponseSnippet } from "@/lib/scheduler/http";
 import { SLUG_BY_PLATFORM } from "@/lib/scheduler/oauth/state";
 import type { TikTokAccountMetadata } from "@/lib/scheduler/adapters/tiktok";
@@ -66,6 +66,14 @@ const INSTAGRAM_PUBLISH_SCOPES = [
   "instagram_business_content_publish",
 ];
 
+// Pin the version explicitly. An unversioned graph.instagram.com call is served
+// at whatever the App Dashboard's "Upgrade API Version" setting happens to be,
+// so it can change under us without a deploy — and it would disagree with
+// lib/meta/client.ts, which versions these same two endpoints.
+function instagramGraphBase(): string {
+  return `https://graph.instagram.com/${getMetaGraphApiVersion()}`;
+}
+
 const instagramProvider: OAuthProvider = {
   platform: "INSTAGRAM",
 
@@ -104,7 +112,7 @@ const instagramProvider: OAuthProvider = {
     // Swap for a 60-day token immediately — the short-lived one expires in an
     // hour and a scheduler holds credentials for months.
     const longLivedResponse = await fetchWithTimeout(
-      `https://graph.instagram.com/access_token?${new URLSearchParams({
+      `${instagramGraphBase()}/access_token?${new URLSearchParams({
         grant_type: "ig_exchange_token",
         client_secret: requireEnv("INSTAGRAM_APP_SECRET"),
         access_token: shortLived.access_token,
@@ -116,7 +124,7 @@ const instagramProvider: OAuthProvider = {
     }>(longLivedResponse, "Instagram long-lived token exchange");
 
     const profileResponse = await fetchWithTimeout(
-      `https://graph.instagram.com/me?${new URLSearchParams({
+      `${instagramGraphBase()}/me?${new URLSearchParams({
         fields: "id,user_id,username,profile_picture_url,account_type",
         access_token: longLived.access_token,
       })}`
@@ -254,6 +262,13 @@ const FACEBOOK_SCOPES = [
   "pages_manage_posts",
 ];
 
+// Every Facebook host here must read the version from env, not hardcode it —
+// otherwise bumping META_GRAPH_API_VERSION moves the whole app except this
+// connect flow, and the mismatch only surfaces when a version is sunset.
+function facebookGraphBase(): string {
+  return `https://graph.facebook.com/${getMetaGraphApiVersion()}`;
+}
+
 const facebookProvider: OAuthProvider = {
   platform: "FACEBOOK_PAGE",
 
@@ -265,19 +280,17 @@ const facebookProvider: OAuthProvider = {
       scope: FACEBOOK_SCOPES.join(","),
       state,
     });
-    return `https://www.facebook.com/v25.0/dialog/oauth?${params}`;
+    return `https://www.facebook.com/${getMetaGraphApiVersion()}/dialog/oauth?${params}`;
   },
 
   async completeConnection(code) {
     const tokenResponse = await fetchWithTimeout(
-      `https://graph.facebook.com/v25.0/oauth/access_token?${new URLSearchParams(
-        {
-          client_id: requireEnv("FACEBOOK_APP_ID"),
-          client_secret: requireEnv("FACEBOOK_APP_SECRET"),
-          redirect_uri: redirectUriFor("FACEBOOK_PAGE"),
-          code,
-        }
-      )}`
+      `${facebookGraphBase()}/oauth/access_token?${new URLSearchParams({
+        client_id: requireEnv("FACEBOOK_APP_ID"),
+        client_secret: requireEnv("FACEBOOK_APP_SECRET"),
+        redirect_uri: redirectUriFor("FACEBOOK_PAGE"),
+        code,
+      })}`
     );
     const shortLived = await readJson<{ access_token: string }>(
       tokenResponse,
@@ -287,14 +300,12 @@ const facebookProvider: OAuthProvider = {
     // Page tokens inherit their lifetime from the user token they came from,
     // so exchange for a long-lived user token BEFORE listing Pages.
     const longLivedResponse = await fetchWithTimeout(
-      `https://graph.facebook.com/v25.0/oauth/access_token?${new URLSearchParams(
-        {
-          grant_type: "fb_exchange_token",
-          client_id: requireEnv("FACEBOOK_APP_ID"),
-          client_secret: requireEnv("FACEBOOK_APP_SECRET"),
-          fb_exchange_token: shortLived.access_token,
-        }
-      )}`
+      `${facebookGraphBase()}/oauth/access_token?${new URLSearchParams({
+        grant_type: "fb_exchange_token",
+        client_id: requireEnv("FACEBOOK_APP_ID"),
+        client_secret: requireEnv("FACEBOOK_APP_SECRET"),
+        fb_exchange_token: shortLived.access_token,
+      })}`
     );
     const longLived = await readJson<{ access_token: string }>(
       longLivedResponse,
@@ -302,7 +313,7 @@ const facebookProvider: OAuthProvider = {
     );
 
     const pagesResponse = await fetchWithTimeout(
-      `https://graph.facebook.com/v25.0/me/accounts?${new URLSearchParams({
+      `${facebookGraphBase()}/me/accounts?${new URLSearchParams({
         fields: "id,name,access_token,category,tasks,picture{url}",
         access_token: longLived.access_token,
       })}`
@@ -346,7 +357,27 @@ const facebookProvider: OAuthProvider = {
 
 // ─── TikTok ─────────────────────────────────────────────────────────────────
 
-const TIKTOK_SCOPES = ["user.info.basic", "video.upload", "video.publish"];
+/**
+ * `video.upload` alone covers the inbox flow, which is what every account uses
+ * by default (`postMode: "INBOX"`). `video.publish` is the Direct Post scope and
+ * is deliberately opt-in via env, because:
+ *
+ *  - TikTok rejects an authorize call containing a scope the app is not
+ *    approved for, so requesting it before approval breaks connecting entirely;
+ *  - their review form warns that submitting unused scopes delays the result;
+ *  - and per the Content Sharing Guidelines, Direct Post approval is unlikely
+ *    for a self-hosted tool in the first place (see the research findings).
+ *
+ * Set TIKTOK_ENABLE_DIRECT_POST=true only once TikTok has approved
+ * `video.publish` for your app.
+ */
+function tiktokScopes(): string[] {
+  const scopes = ["user.info.basic", "video.upload"];
+  if (process.env.TIKTOK_ENABLE_DIRECT_POST === "true") {
+    scopes.push("video.publish");
+  }
+  return scopes;
+}
 
 const tiktokProvider: OAuthProvider = {
   platform: "TIKTOK",
@@ -355,7 +386,7 @@ const tiktokProvider: OAuthProvider = {
     const params = new URLSearchParams({
       client_key: requireEnv("TIKTOK_CLIENT_KEY"),
       response_type: "code",
-      scope: TIKTOK_SCOPES.join(","),
+      scope: tiktokScopes().join(","),
       redirect_uri: redirectUriFor("TIKTOK"),
       state,
     });
@@ -412,7 +443,7 @@ const tiktokProvider: OAuthProvider = {
         accessPlaintextToken: token.access_token,
         refreshPlaintextToken: token.refresh_token,
         expiresAt: new Date(Date.now() + token.expires_in * 1000),
-        scopes: token.scope?.split(",") ?? TIKTOK_SCOPES,
+        scopes: token.scope?.split(",") ?? tiktokScopes(),
         metadata: metadata as unknown as Record<string, unknown>,
       },
     ];

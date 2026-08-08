@@ -18,6 +18,10 @@ import {
   sendPrivateReplyWithLinkButton,
 } from "@/lib/meta/client";
 import { decryptToken } from "@/lib/meta/oauth";
+import {
+  describePrivateReplyWindowExpiry,
+  isWithinPrivateReplyWindow,
+} from "@/lib/meta/private-reply-window";
 import { matchKeywords } from "@/lib/utils/keyword-matcher";
 import { reserveDMSlot } from "@/lib/utils/rate-limiter";
 import {
@@ -51,8 +55,29 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     commenterId,
     commenterName,
     mediaId,
+    commentCreatedAt,
   } = job.data;
   const requeueAttempt = job.data.requeueAttempt ?? 0;
+
+  // Instagram allows exactly ONE private reply per comment — per comment, not
+  // per campaign. Two campaigns can legitimately match the same comment (a
+  // post-specific one plus a match-any-post one), and DmLog's uniqueness is
+  // (automationId, commentId), so nothing below would have stopped the second
+  // campaign from firing a second private reply that Meta is certain to reject.
+  //
+  // Seeded from the DB so a redelivery or a later polling sweep sees replies
+  // sent by earlier runs, then kept current within this run's loop.
+  let privateReplyUsed = Boolean(
+    await prisma.dmLog.findFirst({
+      where: { commentId, status: "SENT", dmSentAt: { not: null } },
+      select: { id: true },
+    })
+  );
+
+  // The other Meta-enforced limit: private replies die 7 days after the comment
+  // was created. Checked here rather than only at ingest because a job can be
+  // requeued repeatedly by the rate limiter and age across the boundary.
+  const windowOpen = isWithinPrivateReplyWindow(commentCreatedAt);
 
   const automations = await prisma.automation.findMany({
     where: {
@@ -251,6 +276,41 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     // this run needed. Don't re-send the DM.
     if (!needsDm) continue;
 
+    // Both guards sit after the public reply leg and before any reservation:
+    // a public reply is still valid in either case, and neither should consume
+    // the workspace's monthly allowance or an hourly rate-limit slot for a send
+    // Meta would refuse. Neither throws — retrying cannot change the outcome.
+    if (!windowOpen) {
+      await prisma.dmLog.update({
+        where: {
+          automationId_commentId: { automationId: automation.id, commentId },
+        },
+        data: {
+          status: "FAILED",
+          matchedKeyword: matchResult.matchedKeyword,
+          errorMessage: commentCreatedAt
+            ? describePrivateReplyWindowExpiry(commentCreatedAt)
+            : "Outside Instagram's 7-day private-reply window",
+        },
+      });
+      continue;
+    }
+
+    if (privateReplyUsed) {
+      await prisma.dmLog.update({
+        where: {
+          automationId_commentId: { automationId: automation.id, commentId },
+        },
+        data: {
+          status: "SKIPPED_DEDUP",
+          matchedKeyword: matchResult.matchedKeyword,
+          errorMessage:
+            "Instagram allows one private reply per comment, and another campaign already sent it",
+        },
+      });
+      continue;
+    }
+
     const usage = await reserveWorkspaceDMSend(automation.workspaceId);
     if (!usage.allowed) {
       await prisma.dmLog.update({
@@ -419,6 +479,10 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           dmMessage
         );
       }
+
+      // The comment's one private reply is now spent — any further campaign
+      // matching this same comment must not attempt another.
+      privateReplyUsed = true;
 
       await prisma.dmLog.update({
         where: {

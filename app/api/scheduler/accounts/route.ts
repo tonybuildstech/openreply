@@ -19,6 +19,12 @@ export const dynamic = "force-dynamic";
  *
  * These caveats are returned rather than buried, because "connected" does not
  * mean "will post publicly" on either of those platforms.
+ *
+ * Also returns the workspace's comment→DM Instagram accounts. They live in a
+ * different table (InstagramAccount, not ConnectedAccount) but describe the
+ * same real profiles, and /connections merges the two on the Instagram account
+ * ID so one profile shows as one entry with both capabilities. Fetching them
+ * together keeps that page on a single request.
  */
 export async function GET() {
   const context = await getCurrentWorkspaceContext();
@@ -29,21 +35,34 @@ export async function GET() {
     );
   }
 
-  const accounts = await prisma.connectedAccount.findMany({
-    where: { workspaceId: context.workspaceId },
-    orderBy: [{ platform: "asc" }, { displayName: "asc" }],
-    select: {
-      id: true,
-      platform: true,
-      platformAccountId: true,
-      displayName: true,
-      avatarUrl: true,
-      status: true,
-      tokenExpiresAt: true,
-      metadata: true,
-      createdAt: true,
-    },
-  });
+  const [accounts, instagramAccounts] = await Promise.all([
+    prisma.connectedAccount.findMany({
+      where: { workspaceId: context.workspaceId },
+      orderBy: [{ platform: "asc" }, { displayName: "asc" }],
+      select: {
+        id: true,
+        platform: true,
+        platformAccountId: true,
+        displayName: true,
+        avatarUrl: true,
+        status: true,
+        tokenExpiresAt: true,
+        metadata: true,
+        createdAt: true,
+      },
+    }),
+    prisma.instagramAccount.findMany({
+      where: { workspaceId: context.workspaceId },
+      orderBy: { connectedAt: "desc" },
+      select: {
+        id: true,
+        instagramId: true,
+        username: true,
+        tokenExpiresAt: true,
+        webhookSubscribed: true,
+      },
+    }),
+  ]);
 
   const youtubeQuota = accounts.some((a) => a.platform === "YOUTUBE")
     ? await getYouTubeQuotaState()
@@ -74,11 +93,12 @@ export async function GET() {
                 : null,
         };
       }),
+      instagramAccounts,
       youtubeQuota,
       constraints: PLATFORM_CONSTRAINTS,
       canManage: canManageWorkspace(context.role),
-      // When on, Instagram is connected once from Settings and this page must
-      // point there rather than offering a second, separate authorization.
+      // When on, one Instagram authorization covers comment→DM and publishing,
+      // so /connections offers a single connect button rather than two.
       unifiedInstagramConnect: isUnifiedInstagramConnectEnabled(),
     },
   });

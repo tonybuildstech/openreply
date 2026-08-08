@@ -20,7 +20,7 @@ import {
  * containing an unapproved permission fails outright for non-tester users, and
  * comment→DM must never be blocked by a feature the user may not even use.
  * `IG_UNIFIED_CONNECT=0` makes messaging-only the default instead, restoring
- * the old split where publishing is connected under Scheduler → Connections.
+ * the old split where publishing is connected separately on Connections.
  */
 export async function GET(request: NextRequest) {
   const context = await getCurrentWorkspaceContext();
@@ -28,7 +28,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.redirect(`${getBaseUrl()}/login`);
   }
   if (!canManageWorkspace(context.role)) {
-    return NextResponse.redirect(`${getBaseUrl()}/settings?instagram=forbidden`);
+    return NextResponse.redirect(`${getBaseUrl()}/connections?instagram=forbidden`);
   }
 
   const optedOut = request.nextUrl.searchParams.get("publish") === "0";

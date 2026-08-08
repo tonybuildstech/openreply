@@ -29,7 +29,7 @@ export async function GET(
   const { platform: slug } = await ctx.params;
   const baseUrl = getBaseUrl();
   const redirectBack = (params: string) =>
-    NextResponse.redirect(`${baseUrl}/scheduler/connections?${params}`);
+    NextResponse.redirect(`${baseUrl}/connections?${params}`);
 
   const platform = PLATFORM_BY_SLUG[slug];
   if (!platform) return redirectBack("error=unknown_platform");

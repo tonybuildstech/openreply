@@ -29,6 +29,12 @@ export interface ProcessCommentJob {
   commenterId: string;
   commenterName?: string;
   mediaId: string;
+  // ISO timestamp of when the comment was created, when we know it. Drives the
+  // 7-day private-reply window check in the worker — see
+  // lib/meta/private-reply-window.ts. Optional because jobs enqueued before
+  // this field existed are still draining, and because a webhook payload
+  // without a usable time should not block the send.
+  commentCreatedAt?: string;
   requeueAttempt?: number;
   // Which path enqueued this comment. Recorded in the shared ProcessedComment
   // dedup store so the reconciler can tell webhook- from polling-caught comments.

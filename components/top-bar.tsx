@@ -15,6 +15,8 @@ const pageTitles: Record<string, string> = {
   "/automations": "Campaigns",
   "/automations/new": "New Campaign",
   "/logs": "DM Logs",
+  "/scheduler": "Scheduler",
+  "/connections": "Connections",
   "/settings": "Settings",
   "/diagnostics": "Diagnostics",
 };

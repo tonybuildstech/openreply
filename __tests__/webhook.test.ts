@@ -91,6 +91,9 @@ describe("parseCommentEvents", () => {
       commenterId: "user_789",
       commenterName: "testuser",
       mediaId: "media_101",
+      // entry.time is seconds; it becomes the comment's creation time for the
+      // 7-day private-reply window check.
+      commentCreatedAt: new Date(1234567890 * 1000).toISOString(),
     });
   });
 

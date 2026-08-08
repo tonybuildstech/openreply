@@ -28,6 +28,19 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: process.cwd(),
   },
+  // Connections stopped being a scheduler sub-page — the same page now manages
+  // Instagram's comment→DM connection too, so it lives at the top level.
+  // Temporary rather than permanent on purpose: a 308 sticks in browser caches
+  // long after the app has moved on.
+  async redirects() {
+    return [
+      {
+        source: "/scheduler/connections",
+        destination: "/connections",
+        permanent: false,
+      },
+    ];
+  },
 };
 
 export default nextConfig;

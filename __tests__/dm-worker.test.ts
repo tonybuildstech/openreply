@@ -17,6 +17,9 @@ const {
     },
     dmLog: {
       findUnique: vi.fn(),
+      // Used to check whether this comment's single allowed private reply has
+      // already been spent by another campaign.
+      findFirst: vi.fn(),
       create: vi.fn(),
       upsert: vi.fn(),
       update: vi.fn(),
@@ -139,7 +142,17 @@ const mockAutomation = {
   trackedLinks: [],
 };
 
-const mockJobData = {
+const mockJobData: {
+  instagramAccountId: string;
+  commentId: string;
+  commentText: string;
+  commenterId: string;
+  commenterName: string;
+  mediaId: string;
+  // Optional, matching ProcessCommentJob: jobs enqueued before this field
+  // existed still drain through the same processor.
+  commentCreatedAt?: string;
+} = {
   instagramAccountId: "ig_456",
   commentId: "comment_555",
   commentText: "I want the LINK!",
@@ -174,6 +187,8 @@ beforeEach(() => {
 
   mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
   mockPrisma.dmLog.findUnique.mockResolvedValue(null);
+  // No prior private reply for this comment unless a test says otherwise.
+  mockPrisma.dmLog.findFirst.mockResolvedValue(null);
   mockPrisma.dmLog.create.mockResolvedValue({});
   mockPrisma.dmLog.upsert.mockResolvedValue({});
   mockPrisma.dmLog.update.mockResolvedValue({});
@@ -258,6 +273,108 @@ describe("DM Worker — Full Pipeline", () => {
         },
       },
       data: expect.objectContaining({ status: "SENT" }),
+    });
+  });
+
+  // Instagram allows exactly ONE private reply per comment — per comment, not
+  // per campaign. Two campaigns matching one comment is a normal setup (a
+  // post-specific one plus a match-any-post one), and DmLog's uniqueness is
+  // (automationId, commentId), so nothing else stops a second send.
+  describe("one private reply per comment", () => {
+    const secondAutomation = {
+      ...mockAutomation,
+      id: "auto_790",
+      matchAnyPost: true,
+      postId: null,
+    };
+
+    it("sends only one private reply when two campaigns match the same comment", async () => {
+      mockPrisma.automation.findMany.mockResolvedValue([
+        mockAutomation,
+        secondAutomation,
+      ]);
+      const processor = getProcessor();
+
+      await processor(createMockJob());
+
+      expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.dmLog.update).toHaveBeenCalledWith({
+        where: {
+          automationId_commentId: {
+            automationId: "auto_790",
+            commentId: "comment_555",
+          },
+        },
+        data: expect.objectContaining({ status: "SKIPPED_DEDUP" }),
+      });
+      // The blocked campaign must not spend the workspace's monthly allowance
+      // or an hourly rate-limit slot on a send that never happens.
+      expect(mockReserveWorkspaceDMSend).toHaveBeenCalledTimes(1);
+      expect(mockReserveDMSlot).toHaveBeenCalledTimes(1);
+    });
+
+    it("skips entirely when an earlier run already used the comment's reply", async () => {
+      mockPrisma.dmLog.findFirst.mockResolvedValue({ id: "dmlog_prior" });
+      const processor = getProcessor();
+
+      await processor(createMockJob());
+
+      expect(mockSendPrivateReply).not.toHaveBeenCalled();
+      expect(mockReserveDMSlot).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("7-day private-reply window", () => {
+    const NINE_DAYS_MS = 9 * 24 * 60 * 60 * 1000;
+
+    it("does not attempt a send for a comment past the window", async () => {
+      const processor = getProcessor();
+
+      await processor(
+        createMockJob({
+          ...mockJobData,
+          commentCreatedAt: new Date(Date.now() - NINE_DAYS_MS).toISOString(),
+        })
+      );
+
+      expect(mockSendPrivateReply).not.toHaveBeenCalled();
+      expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
+      expect(mockReserveDMSlot).not.toHaveBeenCalled();
+      expect(mockPrisma.dmLog.update).toHaveBeenCalledWith({
+        where: {
+          automationId_commentId: {
+            automationId: "auto_789",
+            commentId: "comment_555",
+          },
+        },
+        data: expect.objectContaining({
+          status: "FAILED",
+          errorMessage: expect.stringContaining("7-day"),
+        }),
+      });
+    });
+
+    it("sends normally for a comment inside the window", async () => {
+      const processor = getProcessor();
+
+      await processor(
+        createMockJob({
+          ...mockJobData,
+          commentCreatedAt: new Date(Date.now() - 60_000).toISOString(),
+        })
+      );
+
+      expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+    });
+
+    it("sends when the comment has no recorded timestamp", async () => {
+      // Jobs enqueued before this field existed, and payloads with no usable
+      // time, must keep working — Meta remains the authority.
+      const processor = getProcessor();
+
+      await processor(createMockJob());
+
+      expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
     });
   });
 

@@ -1,28 +1,16 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useSearchParams } from "next/navigation";
-import type { AccountOption } from "@/components/account-select";
+import Link from "next/link";
 
 interface SettingsData {
   workspace: {
     name: string;
     dmsSentThisPeriod: number;
   };
-  instagramAccount: {
-    id: string;
-    username: string;
-    instagramId: string;
-    tokenExpiresAt: string | null;
-    webhookSubscribed: boolean;
-  } | null;
-  instagramAccounts: Array<
-    AccountOption & {
-      tokenExpiresAt: string | null;
-      webhookSubscribed: boolean;
-    }
-  >;
-  unifiedInstagramConnect: boolean;
+  // Only the count is used here — connecting and disconnecting moved to
+  // /connections, which manages Instagram alongside every other platform.
+  instagramAccounts: Array<{ id: string; username: string }>;
 }
 
 interface WorkspaceMembersData {
@@ -57,13 +45,6 @@ export default function SettingsPage() {
   const [inviteRole, setInviteRole] = useState<"ADMIN" | "MEMBER">("MEMBER");
   const [memberError, setMemberError] = useState<string | null>(null);
 
-  // Set by /api/instagram/callback when a consent screen that included the
-  // publishing scope came back refused — the cue to offer the DM-only retry.
-  const searchParams = useSearchParams();
-  const connectDenied =
-    searchParams.get("instagram") === "denied" &&
-    searchParams.get("retry") === "messaging";
-
   useEffect(() => {
     Promise.all([
       fetch("/api/dashboard/stats").then((res) => res.json()),
@@ -80,20 +61,6 @@ export default function SettingsPage() {
     const res = await fetch("/api/workspace/members");
     const payload = await res.json();
     if (payload.success) setMembersData(payload.data);
-  }
-
-  async function disconnectInstagram(instagramAccountId: string) {
-    if (!confirm("Disconnect Instagram? Campaigns for this account will stop sending DMs.")) {
-      return;
-    }
-
-    setBusy(`disconnect:${instagramAccountId}`);
-    await fetch("/api/instagram/disconnect", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ instagramAccountId }),
-    });
-    window.location.reload();
   }
 
   async function inviteMember(event: React.FormEvent) {
@@ -138,106 +105,24 @@ export default function SettingsPage() {
   return (
     <div className="max-w-2xl mx-auto space-y-8">
       <section className="panel rounded p-6">
-        <h2 className="text-base font-semibold mb-6">Instagram Connection</h2>
+        <h2 className="text-base font-semibold mb-2">Connections</h2>
+        <p className="text-sm text-muted">
+          Instagram now lives with every other account OpenReply talks to.
+          Connect, reconnect, and disconnect them on the Connections page.
+        </p>
 
-        <div className="space-y-4">
-          <div className="flex items-center justify-between py-3 border-b border-border">
-            <div>
-              <p className="text-sm font-medium text-foreground">Status</p>
-              <p className="text-xs text-muted mt-0.5">
-                Comment webhooks and private replies depend on this connection.
-              </p>
-            </div>
-            <span
-              className={`px-3 py-1.5 rounded-full text-xs font-medium ${
-                accounts.length > 0
-                  ? "bg-success/10 text-success"
-                  : "bg-warning/10 text-warning"
-              }`}
-            >
-              {accounts.length > 0 ? "Connected" : "Not connected"}
-            </span>
-          </div>
-
-          <div className="flex items-center justify-between py-3 border-b border-border">
-            <div>
-              <p className="text-sm font-medium text-foreground">Accounts</p>
-              <p className="text-xs text-muted mt-0.5">
-                {accounts.length} connected Instagram profile
-                {accounts.length === 1 ? "" : "s"}
-              </p>
-            </div>
-            <span className="text-sm text-muted">
-              {accounts.length > 0 ? `${accounts.length} connected` : "None"}
-            </span>
-          </div>
-
-          <div className="space-y-3 py-3">
-            {accounts.length === 0 && (
-              <p className="text-sm text-muted">
-                Connect an Instagram professional account to launch campaigns.
-              </p>
-            )}
-            {accounts.map((account) => (
-              <div
-                key={account.id}
-                className="flex flex-col gap-3 rounded border border-border bg-surface/70 p-4 sm:flex-row sm:items-center sm:justify-between"
-              >
-                <div>
-                  <p className="text-sm font-semibold text-foreground">
-                    @{account.username}
-                  </p>
-                  <p className="mt-1 text-xs text-muted">
-                    Token expires{" "}
-                    {account.tokenExpiresAt
-                      ? new Date(account.tokenExpiresAt).toLocaleDateString()
-                      : "not available"}{" "}
-                    · {account.webhookSubscribed ? "Webhook ready" : "Webhook pending"}
-                  </p>
-                </div>
-                <button
-                  onClick={() => disconnectInstagram(account.id)}
-                  disabled={busy === `disconnect:${account.id}`}
-                  className="inline-flex items-center justify-center rounded border border-error/20 px-4 py-2 text-sm font-medium text-error transition-all hover:border-error/40 hover:bg-error/10 disabled:opacity-50"
-                >
-                  {busy === `disconnect:${account.id}`
-                    ? "Disconnecting..."
-                    : "Disconnect"}
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="mt-6 pt-4 border-t border-border">
-          <div className="flex gap-3">
-            <a
-              href="/api/instagram/connect"
-              className="px-4 py-2 rounded text-sm font-medium transition-colors bg-accent text-white hover:bg-accent-hover"
-            >
-              {accounts.length > 0 ? "Connect another account" : "Connect Instagram"}
-            </a>
-          </div>
-
-          {data?.unifiedInstagramConnect && (
-            <p className="mt-3 text-xs text-muted">
-              One authorization covers both comment&rarr;DM and scheduled
-              publishing — no need to connect again under Scheduler.
-              {connectDenied && (
-                <>
-                  {" "}
-                  Consent screen refused?{" "}
-                  <a
-                    href="/api/instagram/connect?publish=0"
-                    className="underline hover:text-foreground"
-                  >
-                    Connect for DMs only
-                  </a>
-                  , which skips the publishing permission.
-                </>
-              )}
-            </p>
-          )}
+        <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
+          <p className="text-sm text-foreground">
+            {accounts.length > 0
+              ? `${accounts.length} Instagram account${accounts.length === 1 ? "" : "s"} connected`
+              : "No Instagram accounts connected"}
+          </p>
+          <Link
+            href="/connections"
+            className="rounded bg-accent px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-accent-hover"
+          >
+            Manage connections
+          </Link>
         </div>
       </section>
 

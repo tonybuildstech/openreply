@@ -20,19 +20,19 @@ export async function GET(request: NextRequest) {
   const baseUrl = getBaseUrl();
 
   if (error) {
-    // If this attempt included the publishing scope, tell Settings so it can
+    // If this attempt included the publishing scope, tell Connections so it can
     // offer the messaging-only retry. An unapproved publishing permission is
     // the most likely reason a unified consent screen comes back refused, and
     // comment→DM works fine without it.
     return NextResponse.redirect(
       state?.pub
-        ? `${baseUrl}/settings?instagram=denied&retry=messaging`
-        : `${baseUrl}/settings?instagram=denied`
+        ? `${baseUrl}/connections?instagram=denied&retry=messaging`
+        : `${baseUrl}/connections?instagram=denied`
     );
   }
 
   if (!code || !state) {
-    return NextResponse.redirect(`${baseUrl}/settings?instagram=invalid`);
+    return NextResponse.redirect(`${baseUrl}/connections?instagram=invalid`);
   }
 
   const session = await auth();
@@ -48,7 +48,7 @@ export async function GET(request: NextRequest) {
   });
 
   if (!membership || !canManageWorkspace(membership.role)) {
-    return NextResponse.redirect(`${baseUrl}/settings?instagram=forbidden`);
+    return NextResponse.redirect(`${baseUrl}/connections?instagram=forbidden`);
   }
 
   try {
@@ -71,7 +71,7 @@ export async function GET(request: NextRequest) {
 
     if (!connection.allowed) {
       return NextResponse.redirect(
-        `${baseUrl}/settings?instagram=already_connected`
+        `${baseUrl}/connections?instagram=already_connected`
       );
     }
 
@@ -175,9 +175,9 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    return NextResponse.redirect(`${baseUrl}/dashboard?connected=true`);
+    return NextResponse.redirect(`${baseUrl}/connections?instagram=connected`);
   } catch (err) {
     console.error("[Instagram Callback] Error:", err);
-    return NextResponse.redirect(`${baseUrl}/settings?instagram=failed`);
+    return NextResponse.redirect(`${baseUrl}/connections?instagram=failed`);
   }
 }

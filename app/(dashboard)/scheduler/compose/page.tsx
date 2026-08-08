@@ -382,7 +382,7 @@ export default function ComposePage() {
         {activeAccounts.length === 0 ? (
           <p className="rounded-lg border border-border bg-background px-4 py-6 text-center text-sm text-muted">
             No accounts are connected yet.{" "}
-            <Link href="/scheduler/connections" className="underline">
+            <Link href="/connections" className="underline">
               Connect one
             </Link>
             .

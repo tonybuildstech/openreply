@@ -1,13 +1,23 @@
 "use client";
 
 /**
- * Connections — publishing accounts, grouped into a card per platform.
+ * Connections — every account OpenReply talks to, grouped into a card per
+ * platform. Not scheduler-specific: this is the one place an account is
+ * connected or removed, whatever feature uses it.
  *
- * The design rule: a connected account is not necessarily one that can post
- * publicly. YouTube forces uploads private until the Cloud project passes an
- * audit, and TikTok delivers to the creator's inbox unless the app passes
- * theirs. Both are stated on the card, because a connect button that leads to
- * an invisible post is worse than no button.
+ * Instagram is the case that makes the page general rather than a publishing
+ * list. One Instagram account can carry two capabilities — comment→DM
+ * (InstagramAccount) and scheduled publishing (ConnectedAccount) — and the
+ * default unified connect writes both rows from a single authorization. So the
+ * Instagram card merges the two tables on the Instagram account ID and shows
+ * one entry per real account with the capabilities it actually has, rather than
+ * listing the same profile twice.
+ *
+ * The other rule the page keeps: a connected account is not necessarily one
+ * that can post publicly. YouTube forces uploads private until the Cloud
+ * project passes an audit, and TikTok delivers to the creator's inbox unless
+ * the app passes theirs. Both are stated on the card, because a connect button
+ * that leads to an invisible post is worse than no button.
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -34,6 +44,24 @@ interface ConnectedAccount {
   createdAt: string;
 }
 
+/** An Instagram account connected for comment→DM. */
+interface MessagingAccount {
+  id: string;
+  instagramId: string;
+  username: string;
+  tokenExpiresAt: string | null;
+  webhookSubscribed: boolean;
+}
+
+/** One real Instagram profile, with whichever capabilities it is connected for. */
+interface InstagramConnection {
+  instagramId: string;
+  displayName: string;
+  avatarUrl: string | null;
+  messaging: MessagingAccount | null;
+  publishing: ConnectedAccount | null;
+}
+
 interface YouTubeQuota {
   used: number;
   limit: number;
@@ -50,9 +78,68 @@ const ERROR_MESSAGES: Record<string, string> = {
   unknown_platform: "Unknown platform.",
 };
 
+// Codes set by /api/instagram/connect and /api/instagram/callback, which used
+// to land on Settings and now land here.
+const INSTAGRAM_MESSAGES: Record<string, string> = {
+  denied: "You cancelled the Instagram connection.",
+  invalid: "That Instagram connection link expired. Try again.",
+  forbidden:
+    "You need admin access in this workspace to connect Instagram accounts.",
+  already_connected:
+    "That Instagram account is already connected to another workspace.",
+  failed: "The Instagram connection failed. Check the server logs for details.",
+};
+
+function formatExpiry(value: string | null): string {
+  return value ? new Date(value).toLocaleDateString() : "not available";
+}
+
+/**
+ * Merge the two Instagram tables into one entry per profile, keyed on the
+ * Instagram account ID (`InstagramAccount.instagramId` ===
+ * `ConnectedAccount.platformAccountId`).
+ */
+function mergeInstagram(
+  messaging: MessagingAccount[],
+  publishing: ConnectedAccount[]
+): InstagramConnection[] {
+  const byInstagramId = new Map<string, InstagramConnection>();
+
+  for (const account of messaging) {
+    byInstagramId.set(account.instagramId, {
+      instagramId: account.instagramId,
+      displayName: `@${account.username}`,
+      avatarUrl: null,
+      messaging: account,
+      publishing: null,
+    });
+  }
+
+  for (const account of publishing) {
+    const existing = byInstagramId.get(account.platformAccountId);
+    if (existing) {
+      existing.publishing = account;
+      existing.avatarUrl ??= account.avatarUrl;
+      continue;
+    }
+    byInstagramId.set(account.platformAccountId, {
+      instagramId: account.platformAccountId,
+      displayName: account.displayName,
+      avatarUrl: account.avatarUrl,
+      messaging: null,
+      publishing: account,
+    });
+  }
+
+  return [...byInstagramId.values()];
+}
+
 export default function ConnectionsPage() {
   const searchParams = useSearchParams();
   const [accounts, setAccounts] = useState<ConnectedAccount[]>([]);
+  const [messagingAccounts, setMessagingAccounts] = useState<
+    MessagingAccount[]
+  >([]);
   const [youtubeQuota, setYoutubeQuota] = useState<YouTubeQuota | null>(null);
   const [canManage, setCanManage] = useState(false);
   const [unifiedInstagram, setUnifiedInstagram] = useState(false);
@@ -64,6 +151,7 @@ export default function ConnectionsPage() {
     const payload = await res.json();
     if (payload.success) {
       setAccounts(payload.data.accounts);
+      setMessagingAccounts(payload.data.instagramAccounts ?? []);
       setYoutubeQuota(payload.data.youtubeQuota);
       setCanManage(payload.data.canManage);
       setUnifiedInstagram(Boolean(payload.data.unifiedInstagramConnect));
@@ -97,20 +185,67 @@ export default function ConnectionsPage() {
     void load();
   }
 
+  /**
+   * Removing an Instagram profile has to clear both rows it may own —
+   * otherwise the account disappears from one feature and silently keeps
+   * running in the other.
+   */
+  async function disconnectInstagram(entry: InstagramConnection) {
+    const consequences = [
+      entry.messaging ? "campaigns for it stop sending DMs" : null,
+      entry.publishing ? "posts still scheduled to it are cancelled" : null,
+    ].filter(Boolean);
+
+    if (
+      !confirm(`Disconnect ${entry.displayName}? ${consequences.join(" and ")}.`)
+    ) {
+      return;
+    }
+
+    setBusy(`instagram:${entry.instagramId}`);
+    if (entry.messaging) {
+      await fetch("/api/instagram/disconnect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instagramAccountId: entry.messaging.id }),
+      });
+    }
+    if (entry.publishing) {
+      await fetch("/api/scheduler/accounts", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ connectedAccountId: entry.publishing.id }),
+      });
+    }
+    setBusy(null);
+    void load();
+  }
+
   const error = searchParams.get("error");
   const connected = searchParams.get("connected");
   const connectedCount = searchParams.get("count");
+  const instagramStatus = searchParams.get("instagram");
+  // Set by /api/instagram/callback when a consent screen that included the
+  // publishing scope came back refused — the cue to offer the DM-only retry.
+  const instagramRetryMessaging =
+    instagramStatus === "denied" && searchParams.get("retry") === "messaging";
 
   if (loading) {
     return <p className="text-sm text-muted">Loading connections…</p>;
   }
+
+  const instagramConnections = mergeInstagram(
+    messagingAccounts,
+    accounts.filter((account) => account.platform === "INSTAGRAM")
+  );
 
   return (
     <div className="space-y-6">
       <header className="space-y-1">
         <h1 className="text-xl font-semibold">Connections</h1>
         <p className="text-sm text-muted">
-          Accounts OpenReply can publish to. Connect as many per platform as you
+          Every account OpenReply works with — Instagram for comment→DM, and
+          each platform you publish to. Connect as many per platform as you
           like.
         </p>
       </header>
@@ -126,19 +261,46 @@ export default function ConnectionsPage() {
           {Number(connectedCount ?? 1) === 1 ? "" : "s"}.
         </div>
       )}
+      {instagramStatus === "connected" && (
+        <div className="rounded-lg border border-success/40 bg-success/5 px-4 py-3 text-sm text-success">
+          Instagram connected.
+        </div>
+      )}
+      {instagramStatus && instagramStatus !== "connected" && (
+        <div className="rounded-lg border border-error/40 bg-error/5 px-4 py-3 text-sm text-error">
+          {INSTAGRAM_MESSAGES[instagramStatus] ?? "Something went wrong."}
+          {instagramRetryMessaging && (
+            <>
+              {" "}
+              Consent screen refused?{" "}
+              <a
+                href="/api/instagram/connect?publish=0"
+                className="underline hover:text-foreground"
+              >
+                Connect for DMs only
+              </a>
+              , which skips the publishing permission.
+            </>
+          )}
+        </div>
+      )}
 
       <div className="grid gap-4 xl:grid-cols-2">
         {PLATFORM_ORDER.map((platform) => {
           const meta = PLATFORM_META[platform];
+          const isInstagram = platform === "INSTAGRAM";
           const platformAccounts = accounts.filter(
             (a) => a.platform === platform
           );
+          const count = isInstagram
+            ? instagramConnections.length
+            : platformAccounts.length;
 
           // One Instagram authorization covers messaging and publishing, so
           // send people to the single connect rather than asking the same
           // account to consent a second time.
-          const unifiedHere = unifiedInstagram && platform === "INSTAGRAM";
-          const connectHref = unifiedHere
+          const unifiedHere = unifiedInstagram && isInstagram;
+          const connectHref = isInstagram
             ? "/api/instagram/connect"
             : `/api/connections/${meta.slug}/connect`;
 
@@ -155,15 +317,17 @@ export default function ConnectionsPage() {
                       {meta.label}
                     </h2>
                     <p className="text-xs leading-5 text-muted">
-                      {meta.scheduling === "native"
-                        ? "The platform holds the schedule."
-                        : "OpenReply's worker publishes at the scheduled minute."}
+                      {isInstagram
+                        ? "Comment→DM automation, and OpenReply's worker publishes at the scheduled minute."
+                        : meta.scheduling === "native"
+                          ? "The platform holds the schedule."
+                          : "OpenReply's worker publishes at the scheduled minute."}
                     </p>
                   </div>
                 </div>
 
                 <span className="shrink-0 rounded-full border border-border px-2.5 py-1 text-xs text-muted">
-                  {platformAccounts.length}
+                  {count}
                 </span>
               </header>
 
@@ -195,12 +359,124 @@ export default function ConnectionsPage() {
 
                 {unifiedHere && (
                   <p className="mb-3 rounded-lg border border-border bg-background px-3 py-2.5 text-xs leading-5 text-muted">
-                    Instagram is connected once, in Settings — the same
-                    authorization covers comment→DM and publishing here.
+                    One authorization covers both comment→DM and scheduled
+                    publishing — connect an account once and it does both.
                   </p>
                 )}
 
-                {platformAccounts.length === 0 ? (
+                {isInstagram ? (
+                  instagramConnections.length === 0 ? (
+                    <p className="py-2 text-sm text-muted">
+                      No Instagram accounts connected. Campaigns need a
+                      professional account here before they can reply.
+                    </p>
+                  ) : (
+                    <ul className="space-y-2">
+                      {instagramConnections.map((entry) => {
+                        const publishing = entry.publishing;
+                        const messaging = entry.messaging;
+                        const busyKey = `instagram:${entry.instagramId}`;
+
+                        return (
+                          <li
+                            key={entry.instagramId}
+                            className="rounded-lg border border-border bg-background px-3 py-3"
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="flex min-w-0 items-start gap-3">
+                                <AccountAvatar
+                                  platform="INSTAGRAM"
+                                  avatarUrl={entry.avatarUrl}
+                                  displayName={entry.displayName}
+                                />
+                                <div className="min-w-0 space-y-1.5">
+                                  <p className="truncate text-sm font-medium">
+                                    {entry.displayName}
+                                  </p>
+
+                                  <div className="flex flex-wrap gap-1.5">
+                                    {messaging && (
+                                      <span className="rounded-full border border-border px-2 py-0.5 text-xs text-muted">
+                                        Comment→DM
+                                      </span>
+                                    )}
+                                    {publishing && (
+                                      <span className="rounded-full border border-border px-2 py-0.5 text-xs text-muted">
+                                        Publishing
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  {publishing?.status === "NEEDS_REAUTH" ? (
+                                    <p className="text-xs text-error">
+                                      Access expired — reconnect to resume
+                                      posting
+                                    </p>
+                                  ) : publishing?.status === "DISABLED" ? (
+                                    <p className="text-xs text-muted">
+                                      Disabled
+                                    </p>
+                                  ) : (
+                                    <p className="text-xs text-success">
+                                      Connected
+                                    </p>
+                                  )}
+
+                                  <p className="text-xs text-muted">
+                                    Token expires{" "}
+                                    {formatExpiry(
+                                      messaging?.tokenExpiresAt ??
+                                        publishing?.tokenExpiresAt ??
+                                        null
+                                    )}
+                                    {messaging && (
+                                      <>
+                                        {" · "}
+                                        {messaging.webhookSubscribed
+                                          ? "Webhook ready"
+                                          : "Webhook pending"}
+                                      </>
+                                    )}
+                                  </p>
+                                </div>
+                              </div>
+
+                              {canManage && (
+                                <button
+                                  onClick={() => void disconnectInstagram(entry)}
+                                  disabled={busy === busyKey}
+                                  className="shrink-0 rounded-md px-2 py-1 text-xs text-muted transition hover:bg-surface hover:text-error disabled:opacity-50"
+                                >
+                                  {busy === busyKey
+                                    ? "Removing…"
+                                    : "Disconnect"}
+                                </button>
+                              )}
+                            </div>
+
+                            {!messaging && (
+                              <p className="mt-2.5 rounded-md border border-warning/30 bg-warning/5 px-2.5 py-2 text-xs leading-5 text-warning">
+                                Publishing only — this account cannot reply to
+                                comments yet. Reconnect it to add comment→DM.
+                              </p>
+                            )}
+                            {messaging && !publishing && (
+                              <p className="mt-2.5 rounded-md border border-border bg-surface px-2.5 py-2 text-xs leading-5 text-muted">
+                                Comment→DM only. Reconnect to also schedule
+                                posts to this account.
+                              </p>
+                            )}
+                            {publishing?.limitation && (
+                              <p className="mt-2.5 rounded-md border border-warning/30 bg-warning/5 px-2.5 py-2 text-xs leading-5 text-warning">
+                                {publishing.limitation}
+                              </p>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )
+                ) : platformAccounts.length === 0 ? (
                   <p className="py-2 text-sm text-muted">
                     No {meta.label} accounts connected.
                   </p>
@@ -257,14 +533,25 @@ export default function ConnectionsPage() {
               </div>
 
               {canManage && (
-                <footer className="border-t border-border px-5 py-3">
+                <footer className="space-y-2 border-t border-border px-5 py-3">
                   <a
                     href={connectHref}
                     className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-border px-3 py-2 text-sm font-medium transition hover:bg-background"
                   >
                     <PlatformLogo platform={platform} className="h-4 w-4" />
-                    Connect {platformAccounts.length > 0 ? "another" : meta.label}
+                    Connect {count > 0 ? "another" : meta.label}
                   </a>
+
+                  {/* With IG_UNIFIED_CONNECT off, publishing is a separate
+                      authorization and has to be offered separately. */}
+                  {isInstagram && !unifiedInstagram && (
+                    <a
+                      href={`/api/connections/${meta.slug}/connect`}
+                      className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-border px-3 py-2 text-sm text-muted transition hover:bg-background hover:text-foreground"
+                    >
+                      Connect for publishing
+                    </a>
+                  )}
                 </footer>
               )}
             </section>
