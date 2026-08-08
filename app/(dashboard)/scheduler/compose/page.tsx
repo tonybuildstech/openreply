@@ -45,6 +45,9 @@ import {
 } from "@/lib/media/aspect";
 import TagPeopleModal from "@/components/scheduler/tag-people-modal";
 import { MAX_TAGS_PER_ITEM } from "@/lib/scheduler/media-input";
+// The same minute-to-minute rule the API validates with, so the composer and
+// the server cannot disagree about how far away a chosen minute is.
+import { leadTimeMinutes } from "@/lib/scheduler/constraints";
 import {
   CAROUSEL_MAX_ITEMS,
   TIKTOK_PHOTO_MAX_ITEMS,
@@ -682,6 +685,35 @@ export default function ComposePage() {
   }
 
   /**
+   * The strictest lead time the ticked platforms impose, and the first whole
+   * minute that satisfies it.
+   *
+   * Exists because the refusal is otherwise a dead end. The time is step 3 and
+   * the accounts are step 4, so a legal choice is made BEFORE the check that
+   * judges it can run at all — and the minute spent picking accounts is the
+   * very thing that can push it out of range. Offering the fix costs one line
+   * of UI; leaving the user to work out which minute we would accept does not.
+   */
+  const earliestAllowed = useMemo(() => {
+    if (targets.length === 0 || now === null) return null;
+
+    let minutes = 0;
+    for (const target of targets) {
+      const account = accountById.get(target.connectedAccountId);
+      const constraint = account ? constraints[account.platform] : undefined;
+      if (constraint) {
+        minutes = Math.max(minutes, constraint.minLeadTimeMinutes);
+      }
+    }
+    if (minutes === 0) return null;
+
+    // Rounded UP to the next whole minute. Rounding down would hand back a
+    // minute that reads as legal here and is refused seconds later.
+    const at = new Date(Math.ceil((now + minutes * 60_000) / 60_000) * 60_000);
+    return { minutes, at, value: toLocalInputValue(at) };
+  }, [targets, accountById, constraints, now]);
+
+  /**
    * Client-side warnings for the platforms actually selected. The API
    * re-validates everything — this exists so the user finds out before
    * submitting, not after.
@@ -689,7 +721,10 @@ export default function ComposePage() {
   const warnings = useMemo(() => {
     if (media.length === 0 || targets.length === 0 || now === null) return [];
     const when = new Date(scheduledAt);
-    const minutesAhead = (when.getTime() - now) / 60_000;
+    // Whole minutes, matching the control the time was picked with — see
+    // `leadTimeMinutes`. NaN while a half-typed date sits in the field, which
+    // compares false against every limit and so warns about nothing.
+    const minutesAhead = leadTimeMinutes(when, new Date(now));
     const seen = new Set<string>();
     const list: string[] = [];
 
@@ -778,6 +813,13 @@ export default function ComposePage() {
     accountById,
     now,
   ]);
+
+  /** The chosen minute sits inside the strictest ticked platform's floor. */
+  const scheduleTooSoon =
+    earliestAllowed !== null &&
+    now !== null &&
+    leadTimeMinutes(new Date(scheduledAt), new Date(now)) <
+      earliestAllowed.minutes;
 
   /** TikTok Direct Post is invalid until the creator picks a privacy level. */
   const missingTikTokPrivacy = targets.some((target) => {
@@ -1118,6 +1160,20 @@ export default function ComposePage() {
         <p className="mt-2 text-xs text-muted">
           Your local time ({Intl.DateTimeFormat().resolvedOptions().timeZone}).
         </p>
+        {scheduleTooSoon && earliestAllowed && (
+          <button
+            type="button"
+            onClick={() => setScheduledAt(earliestAllowed.value)}
+            className="mt-3 rounded-lg border border-border px-3 py-1.5 text-xs font-medium hover:border-foreground/30"
+          >
+            Too soon — use{" "}
+            {earliestAllowed.at.toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+            })}
+            , the earliest every selected account allows
+          </button>
+        )}
       </Card>
 
       {/* 4 — targets */}

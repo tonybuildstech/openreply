@@ -231,13 +231,37 @@ export interface ScheduleWindowIssue {
   message: string;
 }
 
+/**
+ * Lead time in whole minutes, measured minute-to-minute.
+ *
+ * The composer schedules with a `datetime-local` control, which only offers
+ * whole minutes. Someone reading 22:19 off their clock and picking 22:25 has
+ * chosen what they can plainly see is six minutes; measured against a clock
+ * still carrying seconds it is 5m20s, and twenty seconds later a five-minute
+ * floor refuses it. "I asked for six minutes" answered with "I need five" is
+ * not a limit the user can act on, so both sides floor to the start of the
+ * minute and judge the number the user actually sees.
+ *
+ * Costs at most 59 seconds of permissiveness. That is free for the platforms
+ * our own worker fires, and for Facebook — the only one with a documented
+ * floor — this check was never the authority anyway: the post is handed over
+ * later, by the worker, and Facebook's own answer is final.
+ */
+export function leadTimeMinutes(scheduledAt: Date, now: Date): number {
+  const MINUTE_MS = 60_000;
+  return (
+    Math.floor(scheduledAt.getTime() / MINUTE_MS) -
+    Math.floor(now.getTime() / MINUTE_MS)
+  );
+}
+
 export function validateScheduleWindow(
   platform: SocialPlatform,
   scheduledAt: Date,
   now: Date = new Date()
 ): ScheduleWindowIssue | null {
   const constraints = PLATFORM_CONSTRAINTS[platform];
-  const minutesAhead = (scheduledAt.getTime() - now.getTime()) / 60_000;
+  const minutesAhead = leadTimeMinutes(scheduledAt, now);
 
   if (minutesAhead < constraints.minLeadTimeMinutes) {
     return {

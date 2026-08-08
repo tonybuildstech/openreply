@@ -261,6 +261,23 @@ describe("schedule window validation", () => {
       validateScheduleWindow("INSTAGRAM", new Date("2026-08-09T13:00:00Z"), now)
     ).toBeNull();
   });
+
+  // The composer picks whole minutes. Counting the seconds already elapsed in
+  // the current minute against that turned a visible six minutes into 5m20s,
+  // and TikTok's five-minute floor then refused it.
+  it("counts lead time in whole minutes, not elapsed seconds", () => {
+    const midMinute = new Date("2026-08-09T12:19:40Z");
+
+    expect(
+      validateScheduleWindow("TIKTOK", new Date("2026-08-09T12:25:00Z"), midMinute)
+    ).toBeNull();
+
+    // Still refuses what is genuinely inside the floor.
+    expect(
+      validateScheduleWindow("TIKTOK", new Date("2026-08-09T12:23:00Z"), midMinute)
+        ?.code
+    ).toBe("TOO_SOON");
+  });
 });
 
 describe("media validation", () => {
