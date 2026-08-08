@@ -34,9 +34,15 @@ import {
   selectionBlocker,
   type PlatformKey,
 } from "@/components/scheduler/platform-meta";
-import { cropImageToRatio } from "@/lib/media/crop-image";
+import { prepareImage } from "@/lib/media/crop-image";
 import { probeMedia } from "@/lib/media/probe";
-import type { AspectPreset } from "@/lib/media/aspect";
+import {
+  CENTRED_FOCUS,
+  FEED_PRESETS,
+  type AspectPreset,
+  type CropFocus,
+} from "@/lib/media/aspect";
+import { CAROUSEL_MAX_ITEMS } from "@/lib/scheduler/types";
 import type {
   ComposerAccount,
   ComposerTarget,
@@ -46,17 +52,27 @@ import type {
 /**
  * One picked file, from selection through to submission.
  *
- * `file` is the ORIGINAL the user chose and is kept for the whole session: a
- * ratio change re-crops from it, so switching 4:5 → 1:1 → 4:5 never compounds
- * JPEG loss the way re-cropping the previous crop would.
+ * `file` is the ORIGINAL the user chose and is kept for the whole session:
+ * every crop re-renders from it, so switching 4:5 → 1:1 → 4:5, or nudging the
+ * crop twenty times while dragging, never compounds JPEG loss the way
+ * re-cropping the previous crop would.
  */
 interface ComposerMediaItem extends TrayItem {
   file: File;
   /** Null while the upload is in flight. */
   storageKey: string | null;
-  /** Set once a crop has been applied, e.g. "4:5". */
+  /** Set once a crop has been applied, e.g. "PORTRAIT". */
   croppedToRatio: string | null;
 }
+
+/**
+ * How long to wait after the last crop change before re-rendering the file.
+ *
+ * Dragging the crop fires on every pointer move; without this each one would
+ * decode, re-encode and upload the whole photo. Long enough to coalesce a drag,
+ * short enough that a single click on a ratio still feels immediate.
+ */
+const CROP_DEBOUNCE_MS = 250;
 
 interface PlatformConstraint {
   videoMimeTypes: string[];
@@ -69,9 +85,6 @@ interface PlatformConstraint {
   maxLeadTimeDays: number;
   notes: string[];
 }
-
-/** Instagram's carousel ceiling, and the most any platform accepts. */
-const MAX_ITEMS = 10;
 
 /** Datetime-local wants local wall time, not an ISO instant. */
 function toLocalInputValue(date: Date): string {
@@ -135,14 +148,24 @@ export default function ComposePage() {
   );
 
   const instagramRange = constraints.INSTAGRAM?.imageAspectRatioRange;
+  const instagramMaxImageBytes = constraints.INSTAGRAM?.maxImageBytes;
 
-  /** Items Instagram would reject outright until they are cropped. */
+  // Read from the constraints the API already sends rather than hardcoded
+  // here — that is what kept this in step with the server when the ceiling
+  // moved. CAROUSEL_MAX_ITEMS is only the fallback for the first render,
+  // before /api/scheduler/accounts has answered.
+  const maxItems =
+    constraints.INSTAGRAM?.carousel?.maxItems ?? CAROUSEL_MAX_ITEMS;
+
+  /** Items Instagram would reject outright until they are cropped or resized. */
   const blockedItems = useMemo(
     () =>
       media
-        .map((item) => itemBlocker(item, instagramRange))
-        .filter((blocker): blocker is string => blocker !== null),
-    [media, instagramRange]
+        .map((item) =>
+          itemBlocker(item, instagramRange, instagramMaxImageBytes)
+        )
+        .filter((blocker) => blocker !== null),
+    [media, instagramRange, instagramMaxImageBytes]
   );
 
 
@@ -220,12 +243,12 @@ export default function ComposePage() {
 
   /** Probe, then upload, each picked file — appended in the order chosen. */
   async function addFiles(files: File[]) {
-    const room = MAX_ITEMS - media.length;
+    const room = maxItems - media.length;
     if (room <= 0) return;
 
     const accepted = files.slice(0, room);
     if (accepted.length < files.length) {
-      setError(`Instagram allows at most ${MAX_ITEMS} items in one post.`);
+      setError(`Instagram allows at most ${maxItems} items in one post.`);
     }
 
     const staged: ComposerMediaItem[] = accepted.map((file) => ({
@@ -236,12 +259,17 @@ export default function ComposePage() {
       mimeType: file.type,
       sizeBytes: file.size,
       kind: file.type.startsWith("image/") ? "IMAGE" : "VIDEO",
-      widthPx: null,
-      heightPx: null,
+      sourceWidthPx: null,
+      sourceHeightPx: null,
+      outputWidthPx: null,
+      outputHeightPx: null,
       storageKey: null,
       ratioId: "ORIGINAL",
+      focus: CENTRED_FOCUS,
       croppedToRatio: null,
+      compressed: false,
       uploading: true,
+      cropPending: false,
       error: null,
     }));
 
@@ -253,8 +281,11 @@ export default function ComposePage() {
       // rather than after a long transfer.
       const probe = await probeMedia(item.file);
       patchItem(item.id, {
-        widthPx: probe.widthPx,
-        heightPx: probe.heightPx,
+        sourceWidthPx: probe.widthPx,
+        sourceHeightPx: probe.heightPx,
+        // Nothing has been applied yet, so what publishes IS the source.
+        outputWidthPx: probe.widthPx,
+        outputHeightPx: probe.heightPx,
       });
 
       try {
@@ -279,69 +310,190 @@ export default function ComposePage() {
   }
 
   /**
-   * Apply (or undo) a crop.
+   * Renders in flight, per item.
    *
-   * Re-crops from the ORIGINAL file every time, then uploads the result as a
-   * new object. The previously uploaded key is left behind: nothing references
-   * it, so it is never published, and the existing "Replace" flow already
-   * orphans files the same way. Cleaning it up would mean a delete endpoint
-   * that accepts a key from the client, which is a worse trade.
+   * A drag fires many changes and each one starts an async decode + encode +
+   * upload. Without a sequence number the LAST result to arrive wins rather
+   * than the LATEST one requested, and the file that publishes is whichever
+   * encode happened to finish last — a crop the user never chose and cannot
+   * see, because the overlay shows their intent either way.
    */
-  async function applyRatio(id: string, preset: AspectPreset) {
-    const item = media.find((entry) => entry.id === id);
-    if (!item || item.kind !== "IMAGE") return;
+  const renderSeq = useRef(new Map<string, number>());
+  const cropTimers = useRef(new Map<string, number>());
 
-    patchItem(id, { ratioId: preset.id, uploading: true, error: null });
+  useEffect(() => {
+    const timers = cropTimers.current;
+    return () => {
+      for (const timer of timers.values()) window.clearTimeout(timer);
+    };
+  }, []);
+
+  /**
+   * Produce the file this item should publish, and upload it.
+   *
+   * Always renders from the ORIGINAL file, then uploads the result as a new
+   * object. The previously uploaded key is left behind: nothing references it,
+   * so it is never published, and the existing "Replace" flow already orphans
+   * files the same way. Cleaning it up would mean a delete endpoint that
+   * accepts a key from the client, which is a worse trade.
+   */
+  async function renderAndUpload(
+    item: ComposerMediaItem,
+    next: { ratioId: string; focus: CropFocus; compress: boolean }
+  ) {
+    const { id, file } = item;
+    const seq = (renderSeq.current.get(id) ?? 0) + 1;
+    renderSeq.current.set(id, seq);
+
+    /** Drop a result that a newer request has already superseded. */
+    const stale = () => renderSeq.current.get(id) !== seq;
+
+    const preset =
+      FEED_PRESETS.find((option) => option.id === next.ratioId) ??
+      FEED_PRESETS[0];
+
+    patchItem(id, { uploading: true, error: null });
 
     try {
-      if (preset.ratio === null) {
-        // Back to the untouched original — the no-re-encode path.
+      // "Original" with no compression is the one path that re-encodes
+      // nothing — the bytes the user chose are the bytes that go up.
+      if (preset.ratio === null && !next.compress) {
         const { storageKey, sizeBytes } = await uploadBlob(
-          item.file,
-          item.file.type,
-          item.file.name
+          file,
+          file.type,
+          file.name
         );
+        if (stale()) return;
         patchItem(id, {
           storageKey,
           sizeBytes,
           croppedToRatio: null,
-          widthPx: item.widthPx,
-          heightPx: item.heightPx,
+          compressed: false,
+          outputWidthPx: item.sourceWidthPx,
+          outputHeightPx: item.sourceHeightPx,
           uploading: false,
+          cropPending: false,
         });
         return;
       }
 
-      const cropped = await cropImageToRatio(
-        item.file,
-        preset.ratio,
-        preset.label
-      );
+      const rendered = await prepareImage(file, {
+        targetRatio: preset.ratio,
+        focus: next.focus,
+        ratioLabel: preset.label,
+        // Instagram scales anything wider down to 1440 itself, so producing it
+        // here costs no visible quality and is what brings an oversized photo
+        // under the 8 MB cap.
+        maxBytes: instagramMaxImageBytes,
+      });
+      if (stale()) return;
+
       const { storageKey, sizeBytes } = await uploadBlob(
-        cropped.blob,
+        rendered.blob,
         "image/jpeg",
-        item.file.name.replace(/\.[^.]+$/, "") + ".jpg"
+        file.name.replace(/\.[^.]+$/, "") + ".jpg"
       );
+      if (stale()) return;
 
       patchItem(id, {
         storageKey,
         sizeBytes,
-        widthPx: cropped.widthPx,
-        heightPx: cropped.heightPx,
-        croppedToRatio: preset.id,
+        outputWidthPx: rendered.widthPx,
+        outputHeightPx: rendered.heightPx,
+        croppedToRatio: preset.ratio === null ? null : preset.id,
+        compressed: next.compress,
         uploading: false,
+        cropPending: false,
       });
-    } catch (cropError) {
+    } catch (renderError) {
+      if (stale()) return;
       patchItem(id, {
         ratioId: "ORIGINAL",
         uploading: false,
+        cropPending: false,
         error:
-          cropError instanceof Error ? cropError.message : "Could not crop this image",
+          renderError instanceof Error
+            ? renderError.message
+            : "Could not crop this image",
       });
     }
   }
 
+  /** Coalesce a burst of crop changes into one render. */
+  function scheduleRender(
+    item: ComposerMediaItem,
+    next: { ratioId: string; focus: CropFocus; compress: boolean }
+  ) {
+    const existing = cropTimers.current.get(item.id);
+    if (existing !== undefined) window.clearTimeout(existing);
+
+    cropTimers.current.set(
+      item.id,
+      window.setTimeout(() => {
+        cropTimers.current.delete(item.id);
+        void renderAndUpload(item, next);
+      }, CROP_DEBOUNCE_MS)
+    );
+  }
+
+  /** Switch this image to a different aspect ratio, re-centring the crop. */
+  function applyRatio(id: string, preset: AspectPreset) {
+    const item = media.find((entry) => entry.id === id);
+    if (!item || item.kind !== "IMAGE") return;
+
+    // A new shape keeps nothing of the old framing, so the previous focus is
+    // meaningless against it — start from the centre, as Instagram would.
+    patchItem(id, {
+      ratioId: preset.id,
+      focus: CENTRED_FOCUS,
+      cropPending: true,
+      error: null,
+    });
+    scheduleRender(item, {
+      ratioId: preset.id,
+      focus: CENTRED_FOCUS,
+      compress: item.compressed && preset.ratio === null,
+    });
+  }
+
+  /** Move the crop window. Updates the overlay now, the file shortly after. */
+  function applyFocus(id: string, focus: CropFocus) {
+    const item = media.find((entry) => entry.id === id);
+    if (!item || item.kind !== "IMAGE" || item.ratioId === "ORIGINAL") return;
+
+    patchItem(id, { focus, cropPending: true });
+    scheduleRender(item, {
+      ratioId: item.ratioId,
+      focus,
+      compress: item.compressed,
+    });
+  }
+
+  /**
+   * Re-encode an oversized photo at Instagram's own width ceiling.
+   *
+   * Explicit rather than automatic: this is a re-encode, and the composer's
+   * promise is that nothing is re-encoded without a click.
+   */
+  function compressItem(id: string) {
+    const item = media.find((entry) => entry.id === id);
+    if (!item || item.kind !== "IMAGE") return;
+
+    patchItem(id, { cropPending: true, error: null });
+    scheduleRender(item, {
+      ratioId: item.ratioId,
+      focus: item.focus,
+      compress: true,
+    });
+  }
+
   function removeItem(id: string) {
+    // Cancel any pending render so it cannot resurrect a removed item's state.
+    const timer = cropTimers.current.get(id);
+    if (timer !== undefined) window.clearTimeout(timer);
+    cropTimers.current.delete(id);
+    renderSeq.current.set(id, (renderSeq.current.get(id) ?? 0) + 1);
+
     setMedia((current) => {
       const target = current.find((item) => item.id === id);
       if (target) URL.revokeObjectURL(target.previewUrl);
@@ -442,14 +594,17 @@ export default function ComposePage() {
           );
         }
 
-        const cap =
-          item.kind === "IMAGE" ? constraint.maxImageBytes : constraint.maxFileBytes;
-        if (cap && item.sizeBytes > cap) {
+        // Video only. An oversized PHOTO is already reported per-tile by
+        // `itemBlocker`, with a button that fixes it — repeating it here would
+        // put the same problem on screen twice, once without the remedy.
+        if (
+          item.kind === "VIDEO" &&
+          constraint.maxFileBytes &&
+          item.sizeBytes > constraint.maxFileBytes
+        ) {
           push(
-            `${label}-size-${item.kind}`,
-            item.kind === "IMAGE"
-              ? `${label} limits photos to ${Math.round(cap / 1024 ** 2)} MB.`
-              : `${label} limits uploads to ${(cap / 1024 ** 3).toFixed(1)} GB.`
+            `${label}-size-VIDEO`,
+            `${label} limits uploads to ${(constraint.maxFileBytes / 1024 ** 3).toFixed(1)} GB.`
           );
         }
       }
@@ -484,8 +639,13 @@ export default function ComposePage() {
 
   const canSubmit =
     media.length > 0 &&
-    // Every file has to be in storage before the API can be told about it.
-    media.every((item) => item.storageKey !== null && !item.uploading) &&
+    // Every file has to be in storage before the API can be told about it, and
+    // `cropPending` covers the gap a debounce opens: the overlay already shows
+    // the new framing while the file on disk is still the old one.
+    media.every(
+      (item) =>
+        item.storageKey !== null && !item.uploading && !item.cropPending
+    ) &&
     // An out-of-range still is a hard stop: Instagram rejects the container
     // rather than cropping, and that failure would land in the worker.
     blockedItems.length === 0 &&
@@ -509,8 +669,11 @@ export default function ComposePage() {
         // dimensions and any crop we applied are sent.
         media: media.map((item) => ({
           storageKey: item.storageKey as string,
-          ...(item.widthPx ? { widthPx: item.widthPx } : {}),
-          ...(item.heightPx ? { heightPx: item.heightPx } : {}),
+          // The dimensions of what will PUBLISH, not of what was picked — after
+          // a crop or a resize those are different numbers, and the row should
+          // describe the file the worker is going to send.
+          ...(item.outputWidthPx ? { widthPx: item.outputWidthPx } : {}),
+          ...(item.outputHeightPx ? { heightPx: item.outputHeightPx } : {}),
           ...(item.croppedToRatio
             ? { croppedToRatio: item.croppedToRatio }
             : {}),
@@ -569,19 +732,22 @@ export default function ComposePage() {
             <MediaTray
               items={media}
               imageRange={instagramRange}
+              maxImageBytes={instagramMaxImageBytes}
               onReorder={reorder}
               onRemove={removeItem}
-              onRatioChange={(id, preset) => void applyRatio(id, preset)}
+              onRatioChange={applyRatio}
+              onFocusChange={applyFocus}
+              onCompress={compressItem}
               onApplyRatioToAll={(preset) => {
                 for (const item of media) {
-                  if (item.kind === "IMAGE") void applyRatio(item.id, preset);
+                  if (item.kind === "IMAGE") applyRatio(item.id, preset);
                 }
               }}
             />
           </div>
         )}
 
-        {media.length < MAX_ITEMS && (
+        {media.length < maxItems && (
           <label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-border bg-background px-6 py-8 text-center transition hover:border-foreground/30">
             <span className="text-sm font-medium">
               {uploading
@@ -591,7 +757,7 @@ export default function ComposePage() {
                   : "Add another"}
             </span>
             <span className="text-xs text-muted">
-              JPEG photos or MP4 / MOV / WebM video. Up to {MAX_ITEMS} items —
+              JPEG photos or MP4 / MOV / WebM video. Up to {maxItems} items —
               two or more become an Instagram carousel.
             </span>
             <input
@@ -613,8 +779,8 @@ export default function ComposePage() {
         {media.length > 0 && (
           <p className="mt-3 text-xs text-muted">
             {mediaKinds.length > 1
-              ? `${mediaKinds.length} items — drag to reorder, or use the arrows.`
-              : "Drag in more files to build a carousel."}
+              ? `${mediaKinds.length} items — drag a tile by its name row to reorder, or use the arrows. Drag inside a preview to move its crop.`
+              : "Add more files to build a carousel."}
           </p>
         )}
       </Card>
@@ -826,7 +992,16 @@ export default function ComposePage() {
 
                               <PlatformOptions
                                 platform={account.platform}
-                                mediaType={target.mediaType}
+                                // Derived, not the stored value: adding a second
+                                // photo turns an Instagram photo post into a
+                                // carousel, and the options panel decides what
+                                // to show from this. The stored copy goes stale
+                                // exactly when the available options change.
+                                mediaType={derivePostType(
+                                  account.platform,
+                                  mediaKinds,
+                                  target.mediaType
+                                )}
                                 value={target.options}
                                 tiktokPostMode={account.tiktokPostMode}
                                 onChange={(patch) =>
@@ -855,10 +1030,13 @@ export default function ComposePage() {
           {blockedItems.length > 0 && (
             <p className="text-sm text-error">
               {blockedItems.length === 1
-                ? "One photo is outside the aspect ratio Instagram accepts."
-                : `${blockedItems.length} photos are outside the aspect ratio Instagram accepts.`}{" "}
-              Pick a crop on each, or remove them — Instagram rejects the post
-              otherwise.
+                ? "One photo cannot be published as it is."
+                : `${blockedItems.length} photos cannot be published as they are.`}{" "}
+              {blockedItems.some((blocker) => blocker.fix === "CROP") &&
+                "Instagram rejects a photo outside 4:5 to 1.91:1 rather than cropping it. "}
+              {blockedItems.some((blocker) => blocker.fix === "COMPRESS") &&
+                "Instagram's API caps photos well below what the app allows. "}
+              Use the fix offered on each tile, or remove them.
             </p>
           )}
           {warnings.map((warning) => (

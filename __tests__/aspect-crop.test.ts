@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
+  CENTRED_FOCUS,
   FEED_PRESETS,
+  INSTAGRAM_MAX_WIDTH_PX,
   REEL_PRESETS,
+  clampFocusToCrop,
   computeCoverCrop,
   cropOverlayPercent,
   describeRatio,
+  fitWithinWidth,
   isWithinRange,
+  orientationOf,
+  panAxis,
   ratioOf,
   suggestFixPreset,
 } from "../lib/media/aspect";
@@ -128,22 +134,6 @@ describe("computeCoverCrop", () => {
   });
 });
 
-describe("cropOverlayPercent", () => {
-  it("reports full width and a trimmed height for a tall source", () => {
-    const overlay = cropOverlayPercent(1080, 1920, 0.8);
-
-    expect(overlay.widthPercent).toBe(100);
-    expect(overlay.heightPercent).toBeCloseTo(70.3, 1);
-  });
-
-  it("reports 100% on both axes when nothing would be cropped", () => {
-    const overlay = cropOverlayPercent(1080, 1080, 1);
-
-    expect(overlay.widthPercent).toBe(100);
-    expect(overlay.heightPercent).toBe(100);
-  });
-});
-
 /**
  * The guard against the bug this step was written to prevent: the pre-research
  * plan had 9:16 in the feed preset list. At 0.5625 it is outside Instagram's
@@ -208,6 +198,222 @@ describe("suggestFixPreset", () => {
     // Reel presets against the feed range: 9:16 does not qualify, and
     // "Original" is not a crop. Nothing to suggest.
     expect(suggestFixPreset(1080, 1920, FEED_RANGE, REEL_PRESETS)).toBeNull();
+  });
+});
+
+describe("moving the crop", () => {
+  it("centres by default, matching what Instagram itself would do", () => {
+    // The whole focal-point feature has to be a no-op until someone drags.
+    expect(computeCoverCrop(1920, 1080, 1)).toEqual(
+      computeCoverCrop(1920, 1080, 1, CENTRED_FOCUS)
+    );
+  });
+
+  it("slides the window along the free axis without resizing it", () => {
+    const centred = computeCoverCrop(1920, 1080, 1);
+    const left = computeCoverCrop(1920, 1080, 1, { x: 0.2, y: 0.5 });
+
+    expect(left.sx).toBeLessThan(centred.sx);
+    // Moving the crop must never change WHAT SHAPE it is — that would silently
+    // undo the ratio the user picked.
+    expect(left.sw).toBe(centred.sw);
+    expect(left.sh).toBe(centred.sh);
+  });
+
+  it("pins to the edge rather than sampling outside the source", () => {
+    for (const focus of [
+      { x: 0, y: 0 },
+      { x: 1, y: 1 },
+      { x: -5, y: 12 },
+    ]) {
+      const { sx, sy, sw, sh } = computeCoverCrop(1920, 1080, 0.8, focus);
+
+      expect(sx).toBeGreaterThanOrEqual(0);
+      expect(sy).toBeGreaterThanOrEqual(0);
+      expect(sx + sw).toBeLessThanOrEqual(1920);
+      expect(sy + sh).toBeLessThanOrEqual(1080);
+    }
+  });
+
+  it("ignores the axis that has no freedom", () => {
+    // 1920×1080 to 4:5 keeps the full height, so vertical focus does nothing.
+    const a = computeCoverCrop(1920, 1080, 0.8, { x: 0.5, y: 0 });
+    const b = computeCoverCrop(1920, 1080, 0.8, { x: 0.5, y: 1 });
+
+    expect(a).toEqual(b);
+  });
+
+  it("names the axis the user can actually drag", () => {
+    // Landscape source, portrait crop: full height kept, slides sideways.
+    expect(panAxis(1920, 1080, 0.8)).toBe("HORIZONTAL");
+    // Portrait source, landscape crop: full width kept, slides up and down.
+    expect(panAxis(1080, 1920, 1.91)).toBe("VERTICAL");
+    // Already the right shape: nothing to move, so nothing to advertise.
+    expect(panAxis(1080, 1080, 1)).toBe("NONE");
+  });
+});
+
+describe("clampFocusToCrop", () => {
+  it("collapses to the centre on a locked axis", () => {
+    // 1920×1080 to 4:5 keeps the full height, so y has exactly one legal value.
+    const clamped = clampFocusToCrop(1920, 1080, 0.8, { x: 0.5, y: 0.9 });
+
+    expect(clamped.y).toBeCloseTo(0.5, 10);
+  });
+
+  it("keeps the focus where the window still fits", () => {
+    const clamped = clampFocusToCrop(1920, 1080, 1, { x: 0, y: 0.5 });
+    const { sw } = computeCoverCrop(1920, 1080, 1);
+
+    // Half the window's width in from the left edge, and no further.
+    expect(clamped.x).toBeCloseTo(sw / (2 * 1920), 10);
+  });
+
+  it("leaves a focus that is already legal alone", () => {
+    expect(clampFocusToCrop(1920, 1080, 1, { x: 0.45, y: 0.5 })).toEqual({
+      x: 0.45,
+      y: 0.5,
+    });
+  });
+});
+
+describe("cropOverlayPercent", () => {
+  it("reports full width and a trimmed height for a tall source", () => {
+    const overlay = cropOverlayPercent(1080, 1920, 0.8);
+
+    expect(overlay.widthPercent).toBe(100);
+    expect(overlay.heightPercent).toBeCloseTo(70.3, 1);
+  });
+
+  it("reports 100% on both axes when nothing would be cropped", () => {
+    const overlay = cropOverlayPercent(1080, 1080, 1);
+
+    expect(overlay.widthPercent).toBe(100);
+    expect(overlay.heightPercent).toBe(100);
+  });
+
+  it("reports where the window sits, not just how big it is", () => {
+    // Without a position the overlay can only ever be drawn centred, which is
+    // wrong the moment the user moves the crop.
+    const centred = cropOverlayPercent(1920, 1080, 1);
+    const left = cropOverlayPercent(1920, 1080, 1, { x: 0.2, y: 0.5 });
+
+    expect(centred.topPercent).toBe(0);
+    expect(left.leftPercent).toBeLessThan(centred.leftPercent);
+    expect(left.widthPercent).toBe(centred.widthPercent);
+  });
+
+  it("keeps the window inside the box it is drawn on", () => {
+    for (const focus of [{ x: 0, y: 0 }, { x: 1, y: 1 }]) {
+      const o = cropOverlayPercent(1080, 1920, 1.91, focus);
+
+      expect(o.leftPercent).toBeGreaterThanOrEqual(0);
+      expect(o.topPercent).toBeGreaterThanOrEqual(0);
+      expect(o.leftPercent + o.widthPercent).toBeLessThanOrEqual(100.001);
+      expect(o.topPercent + o.heightPercent).toBeLessThanOrEqual(100.001);
+    }
+  });
+});
+
+describe("orientation", () => {
+  it("names ratios the way a person would", () => {
+    expect(orientationOf(0.8)).toBe("VERTICAL");
+    expect(orientationOf(1)).toBe("SQUARE");
+    expect(orientationOf(1.91)).toBe("HORIZONTAL");
+  });
+
+  it("calls near-square near-square", () => {
+    // 1080×1079 is not worth calling "horizontal" to a user.
+    expect(orientationOf(ratioOf(1080, 1079))).toBe("SQUARE");
+  });
+
+  it("labels every preset with the orientation its ratio actually has", () => {
+    // The label is what the user picks from. A preset saying "Vertical" while
+    // cropping to a landscape ratio would be a trap, not a typo.
+    for (const preset of [...FEED_PRESETS, ...REEL_PRESETS]) {
+      if (preset.ratio === null) {
+        expect(preset.orientation).toBeNull();
+        continue;
+      }
+      expect(preset.orientation).toBe(orientationOf(preset.ratio));
+      expect(preset.label.toLowerCase()).toContain(
+        (preset.orientation as string).toLowerCase()
+      );
+    }
+  });
+
+  it("offers a vertical and a horizontal feed crop, not just square", () => {
+    const offered = new Set(FEED_PRESETS.map((p) => p.orientation));
+
+    expect(offered).toContain("VERTICAL");
+    expect(offered).toContain("HORIZONTAL");
+  });
+});
+
+describe("fitWithinWidth", () => {
+  it("leaves an image that already fits completely alone", () => {
+    expect(fitWithinWidth(1080, 1350)).toEqual({ width: 1080, height: 1350 });
+  });
+
+  it("scales down to the platform ceiling", () => {
+    expect(fitWithinWidth(4320, 5400)).toEqual({
+      width: INSTAGRAM_MAX_WIDTH_PX,
+      height: 1800,
+    });
+  });
+
+  it("never upscales a small image to hit the budget", () => {
+    // Adding pixels adds bytes and no detail.
+    expect(fitWithinWidth(320, 400)).toEqual({ width: 320, height: 400 });
+  });
+
+  /**
+   * The bug this exists to prevent, and the reason the rounding is directional.
+   *
+   * A crop can be correct at full size and rejected after the resize: at 1440px
+   * a half-pixel of height rounding moves the ratio by ~0.0013, while a
+   * boundary crop such as 1.9098:1 has only ~0.0003 of margin. Rounding the
+   * wrong way turns the very crop we offered as the fix back into a container
+   * ERROR — at the scheduled minute, in the worker.
+   */
+  it("never rounds a downscaled crop outside the ratio it was cropped to", () => {
+    for (let width = 1500; width <= 6000; width += 61) {
+      for (let height = 1500; height <= 6000; height += 71) {
+        for (const preset of FEED_PRESETS) {
+          if (preset.ratio === null) continue;
+
+          const crop = computeCoverCrop(width, height, preset.ratio);
+          const out = fitWithinWidth(
+            crop.sw,
+            crop.sh,
+            INSTAGRAM_MAX_WIDTH_PX,
+            preset.ratio
+          );
+
+          expect(out.width).toBeLessThanOrEqual(INSTAGRAM_MAX_WIDTH_PX);
+          expect(isWithinRange(ratioOf(out.width, out.height), FEED_RANGE)).toBe(
+            true
+          );
+        }
+      }
+    }
+  });
+
+  it("keeps an uncropped image inside the range when it is downscaled", () => {
+    // The compress-only path passes no target ratio, so the source's own ratio
+    // is what must survive the resize — including one sitting on the boundary.
+    for (const [w, h] of [
+      [3820, 2000], // exactly 1.91:1
+      [2000, 2500], // exactly 4:5
+      [5000, 5000],
+    ]) {
+      const out = fitWithinWidth(w, h);
+
+      expect(isWithinRange(ratioOf(w, h), FEED_RANGE)).toBe(true);
+      expect(isWithinRange(ratioOf(out.width, out.height), FEED_RANGE)).toBe(
+        true
+      );
+    }
   });
 });
 

@@ -71,6 +71,8 @@ import {
 import { buildSignedMediaUrl } from "@/lib/storage/public-url";
 import { resolveAccessToken } from "@/lib/scheduler/tokens";
 import {
+  CAROUSEL_MAX_ITEMS,
+  CAROUSEL_MIN_ITEMS,
   PublishError,
   requireSingleMedia,
   type PublishAdapter,
@@ -105,14 +107,6 @@ function mediaKindOf(post: ScheduledPostWithMedia): MediaKind {
   return kinds.size === 1 ? (post.media[0].kind as MediaKind) : "MIXED";
 }
 
-/** Meta's documented ceiling: "up to 10 images, videos, or a mix of the two". */
-const CAROUSEL_MAX_CHILDREN = 10;
-/**
- * Our floor, not Meta's — the docs state no minimum (see Q14). Two is what the
- * Instagram app itself requires, and a one-item "carousel" should be an IMAGE
- * or REEL post instead.
- */
-const CAROUSEL_MIN_CHILDREN = 2;
 
 function graphBase(): string {
   return `https://graph.instagram.com/${getMetaGraphApiVersion()}`;
@@ -143,18 +137,36 @@ interface InstagramOptions {
   userTags?: string;
 }
 
+/** Split the composer's "a, b, @c" into clean usernames. */
+function toUsernameList(input: string): string[] {
+  return input
+    .split(",")
+    .map((name) => name.trim().replace(/^@/, ""))
+    .filter(Boolean);
+}
+
 /**
  * Meta wants `user_tags` as a JSON array of objects, not a username list.
  * The composer collects the friendlier comma-separated form.
  */
 export function toUserTagsParam(usernames: string): string | null {
-  const tags = usernames
-    .split(",")
-    .map((name) => name.trim().replace(/^@/, ""))
-    .filter(Boolean)
-    .map((username) => ({ username }));
+  const tags = toUsernameList(usernames).map((username) => ({ username }));
 
   return tags.length > 0 ? JSON.stringify(tags) : null;
+}
+
+/**
+ * `collaborators` is a JSON array of usernames — `["a","b"]`.
+ *
+ * It was sent as the raw comma-separated string the composer collects, which is
+ * the form Meta documents for nothing. `user_tags` right above has always been
+ * converted; this one was missed, and the two sit side by side in the composer
+ * looking equally supported.
+ */
+export function toCollaboratorsParam(usernames: string): string | null {
+  const names = toUsernameList(usernames);
+
+  return names.length > 0 ? JSON.stringify(names) : null;
 }
 
 interface MetaErrorBody {
@@ -327,11 +339,38 @@ function reelParams(
     params.set("thumb_offset", String(options.thumbOffset));
   }
   if (options.audioName) params.set("audio_name", options.audioName);
+
+  return params;
+}
+
+/**
+ * The options that describe the POST rather than the file: who it is with,
+ * where it was, who is in it.
+ *
+ * Separated from the per-shape parameters for two reasons. They apply to feed
+ * images and carousels as much as to Reels — until 2026-08-08 the adapter sent
+ * them ONLY on the Reel path while the composer offered them on every shape, so
+ * a collaborator set on a photo post was accepted by the form, written to the
+ * database, and then silently dropped here. It never reached Meta.
+ *
+ * And they are the parameters most likely to be rejected: all three are
+ * documented against `graph.facebook.com`, not the Instagram-Login host we use.
+ * Keeping them in one bag is what lets the caller retry without them rather
+ * than lose the whole post — see `createContainerWithOptions`.
+ */
+function postAttributionParams(
+  post: ScheduledPostWithMedia,
+  include: { userTags: boolean } = { userTags: true }
+): URLSearchParams {
+  const options = (post.platformOptions ?? {}) as InstagramOptions;
+  const params = new URLSearchParams();
+
   if (options.collaborators) {
-    params.set("collaborators", options.collaborators);
+    const collaborators = toCollaboratorsParam(options.collaborators);
+    if (collaborators) params.set("collaborators", collaborators);
   }
   if (options.locationId) params.set("location_id", options.locationId);
-  if (options.userTags) {
+  if (include.userTags && options.userTags) {
     const userTags = toUserTagsParam(options.userTags);
     if (userTags) params.set("user_tags", userTags);
   }
@@ -340,14 +379,81 @@ function reelParams(
 }
 
 /**
- * Single feed image.
+ * Create a container with the attribution options, and fall back to creating it
+ * without them if Meta refuses.
  *
- * Caption only, deliberately. `location_id`, `user_tags` and `collaborators`
- * are documented for images ONLY against `graph.facebook.com`, and image
- * `user_tags` are documented as `{username, x, y}` while our composer collects
- * bare usernames (Q16/Q17). Sending unverified parameters risks a `(#100)` on a
- * post that would otherwise publish; add them once `.dev/probe-ig-params.ts`
- * confirms them.
+ * The trade this makes explicit: a post going out matters more than its
+ * collaborator tag. These parameters are unverified on `graph.instagram.com`,
+ * and the old code's answer was to omit them from feed posts entirely so they
+ * could never break one — which meant they never worked either. Trying them and
+ * retrying clean gets the feature when the host supports it and the post when it
+ * does not, instead of choosing one outcome up front.
+ *
+ * A successful retry appends to `notices`, so the dashboard says what was
+ * dropped. Silently publishing a post missing the thing the user asked for is
+ * the one outcome worse than failing.
+ */
+async function createContainerWithOptions(
+  igUserId: string,
+  base: URLSearchParams,
+  attribution: URLSearchParams,
+  accessPlaintextToken: string,
+  context: string,
+  notices: string[]
+): Promise<string> {
+  const withOptions = new URLSearchParams(base);
+  for (const [key, value] of attribution) withOptions.set(key, value);
+
+  if ([...attribution].length === 0) {
+    return createMediaContainer(
+      igUserId,
+      withOptions,
+      accessPlaintextToken,
+      context
+    );
+  }
+
+  try {
+    return await createMediaContainer(
+      igUserId,
+      withOptions,
+      accessPlaintextToken,
+      context
+    );
+  } catch (error) {
+    if (error instanceof PublishError && error.retryable) {
+      // A throttle or a platform blip. Dropping the options would not help, and
+      // the worker's own retry is the right handler.
+      throw error;
+    }
+
+    const containerId = await createMediaContainer(
+      igUserId,
+      new URLSearchParams(base),
+      accessPlaintextToken,
+      `${context} (retry without collaborators, location and tags)`
+    );
+
+    notices.push(
+      `Instagram rejected the ${[...attribution.keys()].join(", ")} setting${
+        [...attribution.keys()].length === 1 ? "" : "s"
+      } on this post, so it published without ${
+        [...attribution.keys()].length === 1 ? "it" : "them"
+      }.`
+    );
+
+    return containerId;
+  }
+}
+
+/**
+ * Single feed image — the file and the caption.
+ *
+ * Attribution (`collaborators`, `location_id`, `user_tags`) is added by
+ * `createContainerWithOptions`, not here, so that a rejection costs the setting
+ * rather than the post. Note that image `user_tags` are documented as
+ * `{username, x, y}` while the composer collects bare usernames (Q16/Q17), so
+ * that one may well be the parameter that gets dropped.
  */
 function imageParams(
   post: ScheduledPostWithMedia,
@@ -479,18 +585,19 @@ async function createCarouselContainer(
   post: ScheduledPostWithMedia,
   igUserId: string,
   accessPlaintextToken: string,
-  deadline: number
+  deadline: number,
+  notices: string[]
 ): Promise<string> {
   const items = post.media;
 
   // The API and composer both check this first; this is the backstop, and it
   // runs before any container is created so a bad post costs no API calls.
   if (
-    items.length < CAROUSEL_MIN_CHILDREN ||
-    items.length > CAROUSEL_MAX_CHILDREN
+    items.length < CAROUSEL_MIN_ITEMS ||
+    items.length > CAROUSEL_MAX_ITEMS
   ) {
     throw new PublishError(
-      `An Instagram carousel needs between ${CAROUSEL_MIN_CHILDREN} and ${CAROUSEL_MAX_CHILDREN} items — this post has ${items.length}`,
+      `An Instagram carousel needs between ${CAROUSEL_MIN_ITEMS} and ${CAROUSEL_MAX_ITEMS} items — this post has ${items.length}`,
       false
     );
   }
@@ -526,11 +633,17 @@ async function createCarouselContainer(
   });
   if (post.caption) params.set("caption", post.caption);
 
-  return createMediaContainer(
+  return createContainerWithOptions(
     igUserId,
     params,
+    // No `user_tags` on the parent: Meta documents people-tagging on carousel
+    // CHILDREN, and the composer collects one list for the whole post with no
+    // way to say which item a person is in. Collaborators and location do
+    // belong to the post as a whole.
+    postAttributionParams(post, { userTags: false }),
     accessPlaintextToken,
-    "Instagram carousel container"
+    "Instagram carousel container",
+    notices
   );
 }
 
@@ -541,7 +654,8 @@ async function createCarouselContainer(
 async function prepareContainer(
   post: ScheduledPostWithMedia,
   igUserId: string,
-  accessPlaintextToken: string
+  accessPlaintextToken: string,
+  notices: string[]
 ): Promise<string> {
   if (post.mediaType === "CAROUSEL") {
     // One budget for every child AND the parent, not one per container.
@@ -550,7 +664,8 @@ async function prepareContainer(
       post,
       igUserId,
       accessPlaintextToken,
-      deadline
+      deadline,
+      notices
     );
     await waitForContainer(
       containerId,
@@ -567,11 +682,13 @@ async function prepareContainer(
   const deadline = Date.now() + SINGLE_CONTAINER_BUDGET_MS;
 
   if (post.mediaType === "IMAGE") {
-    const containerId = await createMediaContainer(
+    const containerId = await createContainerWithOptions(
       igUserId,
       imageParams(post, media),
+      postAttributionParams(post),
       accessPlaintextToken,
-      "Instagram image container"
+      "Instagram image container",
+      notices
     );
     await waitForContainer(
       containerId,
@@ -584,11 +701,13 @@ async function prepareContainer(
   }
 
   if (post.mediaType === "REEL") {
-    const containerId = await createMediaContainer(
+    const containerId = await createContainerWithOptions(
       igUserId,
       reelParams(post, media),
+      postAttributionParams(post),
       accessPlaintextToken,
-      "Instagram Reel container"
+      "Instagram Reel container",
+      notices
     );
     await waitForContainer(
       containerId,
@@ -622,10 +741,15 @@ export const instagramAdapter: PublishAdapter = {
     // the headroom check is the same for all three shapes.
     await assertPublishingHeadroom(igUserId, accessPlaintextToken);
 
+    // Collected during container creation: anything Instagram refused that we
+    // dropped in order to publish at all.
+    const notices: string[] = [];
+
     const containerId = await prepareContainer(
       post,
       igUserId,
-      accessPlaintextToken
+      accessPlaintextToken,
+      notices
     );
 
     const published = await metaRequest(
@@ -644,6 +768,7 @@ export const instagramAdapter: PublishAdapter = {
     return {
       platformPostId: published.id as string | undefined,
       containerId,
+      notice: notices.length > 0 ? notices.join(" ") : undefined,
     };
   },
 };

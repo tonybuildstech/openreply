@@ -175,12 +175,37 @@ export const MEDIA_TYPE_BY_PLATFORM: Record<
 };
 
 /**
+ * Instagram's carousel bounds — the single source for this number.
+ *
+ * It was duplicated across six files (both API routes, the adapter, the
+ * constraints table, the shape map and the composer). Raising it while missing
+ * one produces an inconsistent boundary in whichever direction hurts most: a
+ * composer that accepts 20 against an API that rejects at 10, or an API that
+ * accepts 20 against an adapter that refuses.
+ *
+ * **The maximum is 20, and that is NOT what Meta's API docs say.** The
+ * Instagram Login content-publishing guide states 10, twice and unambiguously
+ * ("a comma separated list of up to 10 container IDs"). Instagram's own app
+ * allows 20, and Meta's API documentation is known to lag the product — this
+ * integration has already been burned twice by docs that did not match the live
+ * API (`upload_type=resumable`, `audio_name`). Set to 20 on that basis, at the
+ * maintainer's direction, **not on evidence**.
+ *
+ * If the API really does cap at 10, an 11-item carousel fails when the PARENT
+ * container is created — in the worker, at the scheduled minute, after every
+ * child has already uploaded. `.dev/probe-ig-params.ts` probe 9 walks 11 → 20
+ * and reports the real cutoff; set this to whatever it finds.
+ *
+ * The minimum of 2 is ours, not Meta's — the docs state no floor (Q14).
+ */
+export const CAROUSEL_MIN_ITEMS = 2;
+export const CAROUSEL_MAX_ITEMS = 20;
+
+/**
  * How many files each post type takes, and of what kind.
  *
  * Enforced at the API before anything is written, because the alternative is
- * discovering the mismatch at the scheduled minute. Instagram's carousel bounds
- * are the platform's: "up to 10 images, videos, or a mix of the two". The
- * minimum of 2 is ours — Meta documents no floor (see Q14).
+ * discovering the mismatch at the scheduled minute.
  */
 export const MEDIA_SHAPE_BY_POST_TYPE: Record<
   ScheduledPost["mediaType"],
@@ -188,7 +213,11 @@ export const MEDIA_SHAPE_BY_POST_TYPE: Record<
 > = {
   REEL: { minItems: 1, maxItems: 1, kinds: ["VIDEO"] },
   IMAGE: { minItems: 1, maxItems: 1, kinds: ["IMAGE"] },
-  CAROUSEL: { minItems: 2, maxItems: 10, kinds: ["IMAGE", "VIDEO"] },
+  CAROUSEL: {
+    minItems: CAROUSEL_MIN_ITEMS,
+    maxItems: CAROUSEL_MAX_ITEMS,
+    kinds: ["IMAGE", "VIDEO"],
+  },
   SHORT: { minItems: 1, maxItems: 1, kinds: ["VIDEO"] },
   TIKTOK_VIDEO: { minItems: 1, maxItems: 1, kinds: ["VIDEO"] },
   FACEBOOK_REEL: { minItems: 1, maxItems: 1, kinds: ["VIDEO"] },

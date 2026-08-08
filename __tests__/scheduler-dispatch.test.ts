@@ -12,6 +12,8 @@ import {
   selectionBlocker,
 } from "../components/scheduler/platform-meta";
 import {
+  CAROUSEL_MAX_ITEMS,
+  CAROUSEL_MIN_ITEMS,
   MEDIA_SHAPE_BY_POST_TYPE,
   MEDIA_TYPE_BY_PLATFORM,
   PublishError,
@@ -204,8 +206,9 @@ describe("media shape per post type", () => {
   it("lets only a carousel hold more than one file", () => {
     for (const [type, shape] of Object.entries(MEDIA_SHAPE_BY_POST_TYPE)) {
       if (type === "CAROUSEL") {
-        expect(shape.maxItems).toBe(10);
-        expect(shape.minItems).toBe(2);
+        expect(shape.maxItems).toBe(CAROUSEL_MAX_ITEMS);
+        expect(shape.minItems).toBe(CAROUSEL_MIN_ITEMS);
+        expect(shape.maxItems).toBeGreaterThan(shape.minItems);
       } else {
         expect(shape.minItems).toBe(1);
         expect(shape.maxItems).toBe(1);

@@ -15,8 +15,12 @@ import type {
 } from "@/app/generated/prisma/client";
 // Ratio naming lives with the rest of the aspect maths so the composer and
 // this validator cannot disagree about what "4:5" means.
-import { describeRatio } from "@/lib/media/aspect";
-import { MEDIA_SHAPE_BY_POST_TYPE } from "@/lib/scheduler/types";
+import { INSTAGRAM_MAX_WIDTH_PX, describeRatio } from "@/lib/media/aspect";
+import {
+  CAROUSEL_MAX_ITEMS,
+  CAROUSEL_MIN_ITEMS,
+  MEDIA_SHAPE_BY_POST_TYPE,
+} from "@/lib/scheduler/types";
 
 export interface PlatformConstraints {
   /** Accepted video container MIME types. */
@@ -28,6 +32,14 @@ export interface PlatformConstraints {
   maxFileBytes?: number;
   /** Separate from `maxFileBytes` — platforms cap stills far lower than video. */
   maxImageBytes?: number;
+  /**
+   * Widest still the platform will publish.
+   *
+   * Informational for validation — the platform downscales past it rather than
+   * rejecting — but load-bearing for the composer, which renders crops at this
+   * width. It is what turns `maxImageBytes` from a wall into a fixable problem.
+   */
+  maxImageWidthPx?: number;
   minFrameRate?: number;
   maxFrameRate?: number;
   /**
@@ -75,13 +87,28 @@ export const PLATFORM_CONSTRAINTS: Record<SocialPlatform, PlatformConstraints> =
       minDurationSeconds: 3,
       maxDurationSeconds: 90,
       maxFileBytes: 1 * GB,
-      // Documented via Meta's error-code reference: "Image exceeded maximum
-      // file size of 8 MiB."
+      // Documented on Meta's media reference as "8 MB maximum", and returned as
+      // error 2207004 ("The image exceeds the maximum file size: 8 MB").
+      // Re-verified 2026-08-08 because it looks wrong from the outside: the
+      // Instagram APP happily posts a 20 MB photo. That is a different pipeline
+      // — the app re-encodes on the device before anything is uploaded, so
+      // Instagram never receives 20 MB either. The API has no such stage, and
+      // this cap is real for everything OpenReply sends.
+      //
+      // It is also not a wall. Meta documents a maximum width of 1440 "(will be
+      // scaled down to the maximum if necessary)", so the composer renders at
+      // 1440 and the file lands far under this without losing a pixel Instagram
+      // would have kept.
       maxImageBytes: 8 * MIB,
+      maxImageWidthPx: INSTAGRAM_MAX_WIDTH_PX,
       // Documented: "try again with an image that falls within a 4:5 to 1.91:1
       // range". Instagram REJECTS outside this — it does not crop.
       imageAspectRatioRange: { min: 0.8, max: 1.91 },
-      carousel: { minItems: 2, maxItems: 10, allowsVideo: true },
+      carousel: {
+        minItems: CAROUSEL_MIN_ITEMS,
+        maxItems: CAROUSEL_MAX_ITEMS,
+        allowsVideo: true,
+      },
       maxFrameRate: 60,
       // Documented at 50 per rolling 24h per account (research 2026-08-08); was
       // 25 here, which disagreed with Meta's own guide. A carousel counts as

@@ -18,6 +18,7 @@ import {
   type EditableField,
 } from "@/lib/scheduler/editing";
 import {
+  CAROUSEL_MAX_ITEMS,
   MEDIA_TYPE_BY_PLATFORM,
   SCHEDULED_POST_TYPES,
 } from "@/lib/scheduler/types";
@@ -51,7 +52,7 @@ const patchSchema = z.object({
    * Partial edits are not offered on purpose — positions must stay contiguous,
    * and "replace everything" is the only operation that cannot leave a gap.
    */
-  media: z.array(mediaItemSchema).min(1).max(10).optional(),
+  media: z.array(mediaItemSchema).min(1).max(CAROUSEL_MAX_ITEMS).optional(),
 });
 
 interface NewMediaItem {

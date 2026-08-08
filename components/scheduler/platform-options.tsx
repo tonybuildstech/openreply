@@ -116,48 +116,72 @@ function OptionGrid({ children }: { children: ReactNode }) {
 
 // ─── Per platform ───────────────────────────────────────────────────────────
 
+/**
+ * Instagram's per-post options, filtered by the shape being published.
+ *
+ * **Every field here must be one the adapter actually sends for this
+ * `mediaType`.** This component used to show all seven on every shape while
+ * `lib/scheduler/adapters/instagram.ts` sent them only on the Reel path — so a
+ * collaborator typed onto a photo post was accepted by the form, written to the
+ * database, and dropped before the request was built. Nothing surfaced, because
+ * from the outside a silently-omitted parameter and an ignored one look
+ * identical.
+ */
 function InstagramOptions({
+  mediaType,
   value,
   onChange,
-}: Pick<PlatformOptionsProps, "value" | "onChange">) {
+}: Pick<PlatformOptionsProps, "mediaType" | "value" | "onChange">) {
+  const isReel = mediaType === "REEL";
+  // Meta documents people-tagging on carousel CHILDREN, and the composer has no
+  // way to say which item someone is in, so the whole-post list cannot be
+  // honoured here.
+  const supportsUserTags = mediaType !== "CAROUSEL";
+
   return (
     <div className="space-y-4">
       <OptionGrid>
-        <Field
-          label="Audio name"
-          hint="Label shown for the original audio track."
-        >
-          <TextInput
-            value={value.audioName}
-            onChange={(v) => onChange({ audioName: v || undefined })}
-            placeholder="Original audio"
-          />
-        </Field>
+        {isReel && (
+          <Field
+            label="Audio name"
+            hint="Label shown for the original audio track."
+          >
+            <TextInput
+              value={value.audioName}
+              onChange={(v) => onChange({ audioName: v || undefined })}
+              placeholder="Original audio"
+            />
+          </Field>
+        )}
 
-        <Field
-          label="Cover frame (ms)"
-          hint="Milliseconds into the video. Ignored if a cover URL is set."
-        >
-          <TextInput
-            type="number"
-            value={value.thumbOffset}
-            onChange={(v) =>
-              onChange({ thumbOffset: v === "" ? undefined : Number(v) })
-            }
-            placeholder="0"
-          />
-        </Field>
+        {isReel && (
+          <Field
+            label="Cover frame (ms)"
+            hint="Milliseconds into the video. Ignored if a cover URL is set."
+          >
+            <TextInput
+              type="number"
+              value={value.thumbOffset}
+              onChange={(v) =>
+                onChange({ thumbOffset: v === "" ? undefined : Number(v) })
+              }
+              placeholder="0"
+            />
+          </Field>
+        )}
 
-        <Field
-          label="Cover image URL"
-          hint="Must be publicly reachable — Instagram fetches it."
-        >
-          <TextInput
-            value={value.coverUrl}
-            onChange={(v) => onChange({ coverUrl: v || undefined })}
-            placeholder="https://…/cover.jpg"
-          />
-        </Field>
+        {isReel && (
+          <Field
+            label="Cover image URL"
+            hint="Must be publicly reachable — Instagram fetches it."
+          >
+            <TextInput
+              value={value.coverUrl}
+              onChange={(v) => onChange({ coverUrl: v || undefined })}
+              placeholder="https://…/cover.jpg"
+            />
+          </Field>
+        )}
 
         <Field label="Location ID" hint="A Facebook Page ID for the location.">
           <TextInput
@@ -169,7 +193,7 @@ function InstagramOptions({
 
         <Field
           label="Collaborators"
-          hint="Usernames, comma separated. They receive an invite."
+          hint="Usernames, comma separated. They get an invite — the post only shows them as collaborators once they accept it in Instagram."
         >
           <TextInput
             value={value.collaborators}
@@ -178,21 +202,32 @@ function InstagramOptions({
           />
         </Field>
 
-        <Field label="Tag people" hint="Usernames, comma separated.">
-          <TextInput
-            value={value.userTags}
-            onChange={(v) => onChange({ userTags: v || undefined })}
-            placeholder="maya.co, alex"
-          />
-        </Field>
+        {supportsUserTags && (
+          <Field label="Tag people" hint="Usernames, comma separated.">
+            <TextInput
+              value={value.userTags}
+              onChange={(v) => onChange({ userTags: v || undefined })}
+              placeholder="maya.co, alex"
+            />
+          </Field>
+        )}
       </OptionGrid>
 
-      <Toggle
-        label="Also share to feed"
-        hint="Show the Reel in your main profile grid as well as the Reels tab."
-        checked={value.shareToFeed ?? true}
-        onChange={(checked) => onChange({ shareToFeed: checked })}
-      />
+      {isReel && (
+        <Toggle
+          label="Also share to feed"
+          hint="Show the Reel in your main profile grid as well as the Reels tab."
+          checked={value.shareToFeed ?? true}
+          onChange={(checked) => onChange({ shareToFeed: checked })}
+        />
+      )}
+
+      {!supportsUserTags && (
+        <p className="text-xs text-muted">
+          Instagram tags people per carousel item, not per post, so tagging is
+          unavailable on a carousel. Location and collaborators still apply.
+        </p>
+      )}
     </div>
   );
 }
@@ -431,7 +466,13 @@ export default function PlatformOptions({
 }: PlatformOptionsProps) {
   switch (platform) {
     case "INSTAGRAM":
-      return <InstagramOptions value={value} onChange={onChange} />;
+      return (
+        <InstagramOptions
+          mediaType={mediaType}
+          value={value}
+          onChange={onChange}
+        />
+      );
     case "YOUTUBE":
       return <YouTubeOptions value={value} onChange={onChange} />;
     case "TIKTOK":

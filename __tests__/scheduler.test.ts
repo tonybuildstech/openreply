@@ -7,6 +7,10 @@ import {
   encryptOptionalToken,
 } from "../lib/crypto/token-cipher";
 import {
+  CAROUSEL_MAX_ITEMS,
+  CAROUSEL_MIN_ITEMS,
+} from "../lib/scheduler/types";
+import {
   PLATFORM_CONSTRAINTS,
   type MediaItemForValidation,
   validateMediaForPlatform,
@@ -399,8 +403,8 @@ describe("media validation", () => {
   });
 
   describe("item counts per post type", () => {
-    it("accepts a 2–10 item Instagram carousel", () => {
-      for (const count of [2, 5, 10]) {
+    it("accepts a carousel anywhere inside the bounds", () => {
+      for (const count of [CAROUSEL_MIN_ITEMS, 5, CAROUSEL_MAX_ITEMS]) {
         const items = Array.from({ length: count }, () => image());
         expect(
           validateMediaForPlatform("INSTAGRAM", "CAROUSEL", items)
@@ -408,15 +412,32 @@ describe("media validation", () => {
       }
     });
 
-    it("rejects a carousel outside 2–10", () => {
+    it("rejects a carousel outside the bounds", () => {
+      const bounds = new RegExp(
+        `between ${CAROUSEL_MIN_ITEMS} and ${CAROUSEL_MAX_ITEMS} files`
+      );
+
       expect(
         validateMediaForPlatform("INSTAGRAM", "CAROUSEL", [image()])
-      ).toMatch(/between 2 and 10 files/);
+      ).toMatch(bounds);
 
-      const eleven = Array.from({ length: 11 }, () => image());
+      const overCeiling = Array.from({ length: CAROUSEL_MAX_ITEMS + 1 }, () =>
+        image()
+      );
       expect(
-        validateMediaForPlatform("INSTAGRAM", "CAROUSEL", eleven)
-      ).toMatch(/between 2 and 10 files/);
+        validateMediaForPlatform("INSTAGRAM", "CAROUSEL", overCeiling)
+      ).toMatch(bounds);
+    });
+
+    it("keeps the constraints table and the shape map on the same number", () => {
+      // Six files used to carry this literal. These two are what the composer
+      // and the validator each read, so a split between them is the drift that
+      // would actually reach a user.
+      expect(PLATFORM_CONSTRAINTS.INSTAGRAM.carousel).toEqual({
+        minItems: CAROUSEL_MIN_ITEMS,
+        maxItems: CAROUSEL_MAX_ITEMS,
+        allowsVideo: true,
+      });
     });
 
     it("allows a carousel to mix images and video", () => {

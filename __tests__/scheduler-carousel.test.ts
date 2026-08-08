@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  CAROUSEL_MAX_ITEMS,
+  CAROUSEL_MIN_ITEMS,
+} from "../lib/scheduler/types";
 
 /**
  * Instagram's three post shapes, pinned against the 2026-08-08 research.
@@ -95,9 +99,10 @@ function mediaItem(
 function makePost(
   mediaType: string,
   media: Array<Record<string, unknown>>,
-  caption = "shared caption"
+  caption = "shared caption",
+  platformOptions: Record<string, unknown> = {}
 ) {
-  return { mediaType, caption, platformOptions: {}, media } as never;
+  return { mediaType, caption, platformOptions, media } as never;
 }
 
 const account = { platformAccountId: "ig_user_1" } as never;
@@ -235,22 +240,36 @@ describe("Instagram carousel publishing", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(publish(makePost("CAROUSEL", [mediaItem(0)]))).rejects.toThrow(
-      /between 2 and 10 items/
+      new RegExp(`between ${CAROUSEL_MIN_ITEMS} and ${CAROUSEL_MAX_ITEMS} items`)
     );
 
     // The quota pre-flight is allowed; nothing else should have happened.
     expect(containerCalls()).toHaveLength(0);
   });
 
-  it("refuses an eleven-item carousel before making any request", async () => {
+  it("refuses a carousel one item over the ceiling, before any request", async () => {
     vi.stubGlobal("fetch", fakeMeta());
 
-    const items = Array.from({ length: 11 }, (_, i) => mediaItem(i));
+    const items = Array.from({ length: CAROUSEL_MAX_ITEMS + 1 }, (_, i) =>
+      mediaItem(i)
+    );
 
     await expect(publish(makePost("CAROUSEL", items))).rejects.toThrow(
-      /between 2 and 10 items/
+      new RegExp(`between ${CAROUSEL_MIN_ITEMS} and ${CAROUSEL_MAX_ITEMS} items`)
     );
     expect(containerCalls()).toHaveLength(0);
+  });
+
+  it("accepts a carousel exactly at the ceiling", async () => {
+    vi.stubGlobal("fetch", fakeMeta());
+
+    const items = Array.from({ length: CAROUSEL_MAX_ITEMS }, (_, i) =>
+      mediaItem(i)
+    );
+    await publish(makePost("CAROUSEL", items));
+
+    // Every child, plus the parent.
+    expect(containerCalls()).toHaveLength(CAROUSEL_MAX_ITEMS + 1);
   });
 
   it("treats a bad item count as permanent — a retry cannot fix it", async () => {
@@ -301,6 +320,157 @@ describe("Instagram Reel publishing", () => {
     await expect(
       publish(makePost("REEL", [mediaItem(0, "VIDEO"), mediaItem(1, "VIDEO")]))
     ).rejects.toThrow(/single file/);
+  });
+});
+
+/**
+ * Attribution: who the post is with, where it was, who is in it.
+ *
+ * These shipped for eight days reaching Meta on the REEL path only, while the
+ * composer offered them on every shape. A collaborator typed onto a photo post
+ * was validated, stored, and dropped when the request was built — so from the
+ * outside it looked exactly like Instagram ignoring the parameter.
+ */
+describe("Instagram post attribution", () => {
+  it("sends collaborators on a feed IMAGE, not only on a Reel", async () => {
+    vi.stubGlobal("fetch", fakeMeta());
+
+    await publish(
+      makePost("IMAGE", [mediaItem(0)], "a still", {
+        collaborators: "bmw_klub_karlovac",
+      })
+    );
+
+    // The regression, stated as plainly as it can be: this was null.
+    expect(containerCalls()[0].params.get("collaborators")).toBe(
+      '["bmw_klub_karlovac"]'
+    );
+  });
+
+  it("sends collaborators as a JSON array, not the raw comma string", async () => {
+    vi.stubGlobal("fetch", fakeMeta());
+
+    await publish(
+      makePost("REEL", [mediaItem(0, "VIDEO")], "a reel", {
+        // Spacing and @ prefixes are what a person actually types.
+        collaborators: " @studio, brandpartner ",
+      })
+    );
+
+    const sent = containerCalls()[0].params.get("collaborators");
+
+    expect(JSON.parse(sent as string)).toEqual(["studio", "brandpartner"]);
+  });
+
+  it("puts collaborators and location on the carousel parent", async () => {
+    vi.stubGlobal("fetch", fakeMeta());
+
+    await publish(
+      makePost("CAROUSEL", [mediaItem(0), mediaItem(1)], "many", {
+        collaborators: "studio",
+        locationId: "111339405701667",
+        userTags: "maya.co",
+      })
+    );
+
+    const containers = containerCalls();
+    const parent = containers.at(-1)!;
+
+    expect(parent.params.get("collaborators")).toBe('["studio"]');
+    expect(parent.params.get("location_id")).toBe("111339405701667");
+    // Meta tags people per carousel ITEM; a whole-post list cannot say which
+    // item someone is in, so it must not be smuggled onto the parent.
+    expect(parent.params.get("user_tags")).toBeNull();
+
+    for (const child of containers.slice(0, -1)) {
+      expect(child.params.get("collaborators")).toBeNull();
+    }
+  });
+
+  it("publishes without the attribution rather than failing when Meta refuses it", async () => {
+    // Meta rejects any container carrying `collaborators`, and accepts the
+    // same container without it. The post is worth more than the tag.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const target = String(url);
+        const params = new URLSearchParams((init?.body as string) ?? "");
+
+        if (target.includes("content_publishing_limit")) {
+          return json({ data: [{ quota_usage: 0, config: { quota_total: 50 } }] });
+        }
+        if (target.includes("/media_publish")) {
+          calls.push({ url: target, params });
+          return json({ id: "ig_media_published" });
+        }
+        if (target.endsWith("/media")) {
+          calls.push({ url: target, params });
+          if (params.get("collaborators")) {
+            return json(
+              { error: { message: "Invalid parameter", code: 100 } },
+              400
+            );
+          }
+          containerSeq += 1;
+          return json({ id: `container_${containerSeq}` });
+        }
+        if (target.includes("fields=status_code")) {
+          return json({ status_code: "FINISHED" });
+        }
+        throw new Error(`unexpected request: ${target}`);
+      })
+    );
+
+    const result = await publish(
+      makePost("IMAGE", [mediaItem(0)], "a still", { collaborators: "studio" })
+    );
+
+    expect(result.platformPostId).toBe("ig_media_published");
+    // Two attempts: the rejected one and the clean retry.
+    expect(containerCalls()).toHaveLength(2);
+    expect(containerCalls()[1].params.get("collaborators")).toBeNull();
+    // And the user is told. Publishing without what they asked for and saying
+    // nothing is the one outcome worse than failing.
+    expect(result.notice).toMatch(/collaborators/);
+  });
+
+  it("does not retry a throttle by stripping options that were not the problem", async () => {
+    // Code 4 is a rate limit. Dropping the collaborator would not help, and a
+    // second immediate attempt just spends more of the same budget.
+    let attempts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        const target = String(url);
+        if (target.includes("content_publishing_limit")) {
+          return json({ data: [{ quota_usage: 0, config: { quota_total: 50 } }] });
+        }
+        if (target.endsWith("/media")) {
+          attempts += 1;
+          return json(
+            { error: { message: "Application request limit reached", code: 4 } },
+            429
+          );
+        }
+        throw new Error(`unexpected request: ${target}`);
+      })
+    );
+
+    await expect(
+      publish(
+        makePost("IMAGE", [mediaItem(0)], "a still", { collaborators: "studio" })
+      )
+    ).rejects.toThrow(/request limit/);
+
+    expect(attempts).toBe(1);
+  });
+
+  it("makes no extra request when there is nothing to attribute", async () => {
+    vi.stubGlobal("fetch", fakeMeta());
+
+    await publish(makePost("IMAGE", [mediaItem(0)]));
+
+    expect(containerCalls()).toHaveLength(1);
   });
 });
 

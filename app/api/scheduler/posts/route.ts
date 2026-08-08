@@ -11,6 +11,7 @@ import {
 } from "@/lib/scheduler/constraints";
 import { getYouTubeQuotaState } from "@/lib/scheduler/quota";
 import {
+  CAROUSEL_MAX_ITEMS,
   MEDIA_TYPE_BY_PLATFORM,
   SCHEDULED_POST_TYPES,
 } from "@/lib/scheduler/types";
@@ -52,7 +53,7 @@ const mediaItemSchema = z.object({
 const createSchema = z.object({
   // Ordered: index IS carousel position. Ten is Instagram's ceiling and the
   // largest any platform accepts.
-  media: z.array(mediaItemSchema).min(1).max(10),
+  media: z.array(mediaItemSchema).min(1).max(CAROUSEL_MAX_ITEMS),
   caption: z.string().max(5000).default(""),
   scheduledAt: z.string().datetime(),
   targets: z.array(targetSchema).min(1).max(20),
