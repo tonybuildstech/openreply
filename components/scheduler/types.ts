@@ -62,11 +62,33 @@ export interface TikTokTargetOptions {
   /** TikTok forbids a pre-selected default — the creator must choose. */
   privacyLevel?: "PUBLIC_TO_EVERYONE" | "MUTUAL_FOLLOW_FRIENDS" | "SELF_ONLY";
   disableComment?: boolean;
+  /** Video posts only — TikTok's photo endpoint documents neither. */
   disableDuet?: boolean;
   disableStitch?: boolean;
   videoCoverTimestampMs?: number;
   brandContentToggle?: boolean;
   brandOrganicToggle?: boolean;
+
+  // --- Photo carousels only ---
+
+  /**
+   * A short headline, max 90. Photo posts carry a title AND a description; the
+   * shared caption becomes the description, so this is genuinely separate
+   * rather than the caption under another name.
+   *
+   * Shares the name `title` with YouTube's and Facebook's — options are stored
+   * per target, and a target is one account on one platform, so they can never
+   * collide on the same object.
+   */
+  title?: string;
+  /** Which photo is the cover. Zero-based, defaults to the first. */
+  photoCoverIndex?: number;
+  /**
+   * Ask TikTok to add a recommended track. **Not a track picker** — no such API
+   * exists — and Direct Post only. On the inbox path the creator chooses their
+   * own sound in the TikTok app, which is strictly better.
+   */
+  autoAddMusic?: boolean;
 }
 
 export interface FacebookTargetOptions {

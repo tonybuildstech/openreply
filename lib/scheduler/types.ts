@@ -37,14 +37,17 @@ export type ScheduledPostWithMedia = ScheduledPost & {
 };
 
 /**
- * The single file a one-file platform publishes.
+ * The single file a one-file POST TYPE publishes.
  *
- * Only Instagram accepts a carousel. YouTube, TikTok and Facebook take exactly
- * one video, so this throws rather than quietly publishing item 0 — a user who
- * scheduled a 5-image carousel to TikTok must be told it cannot work, not
- * discover later that one arbitrary frame of it went out. The API and composer
- * both refuse this combination first; this is the backstop for the case where
- * they don't.
+ * Multi-item posts are Instagram's CAROUSEL and TikTok's TIKTOK_PHOTO. Every
+ * other type — Reels, Shorts, TikTok video, Facebook video — takes exactly one
+ * file, so this throws rather than quietly publishing item 0: a user who
+ * scheduled five files must be told it cannot work, not discover later that one
+ * arbitrary item went out. The API and composer both refuse the combination
+ * first; this is the backstop for the case where they don't.
+ *
+ * Note this is keyed off the post TYPE, not the platform. TikTok accepts a
+ * carousel of stills and a single video, through two different endpoints.
  */
 export function requireSingleMedia(
   post: ScheduledPostWithMedia
@@ -57,7 +60,7 @@ export function requireSingleMedia(
 
   if (post.media.length > 1) {
     throw new PublishError(
-      `This platform publishes a single file, but this post has ${post.media.length}. Schedule the carousel to Instagram on its own.`,
+      `A ${post.mediaType} post publishes a single file, but this one has ${post.media.length}. Multi-item posts go to Instagram as a carousel, or to TikTok as a photo post.`,
       false
     );
   }
@@ -159,6 +162,7 @@ export const SCHEDULED_POST_TYPES = [
   "CAROUSEL",
   "SHORT",
   "TIKTOK_VIDEO",
+  "TIKTOK_PHOTO",
   "FACEBOOK_REEL",
   "FACEBOOK_VIDEO",
 ] as const satisfies ReadonlyArray<ScheduledPost["mediaType"]>;
@@ -170,7 +174,7 @@ export const MEDIA_TYPE_BY_PLATFORM: Record<
 > = {
   INSTAGRAM: ["REEL", "IMAGE", "CAROUSEL"],
   YOUTUBE: ["SHORT"],
-  TIKTOK: ["TIKTOK_VIDEO"],
+  TIKTOK: ["TIKTOK_VIDEO", "TIKTOK_PHOTO"],
   FACEBOOK_PAGE: ["FACEBOOK_REEL", "FACEBOOK_VIDEO"],
 };
 
@@ -210,6 +214,36 @@ export const CAROUSEL_MIN_ITEMS = 2;
 export const CAROUSEL_MAX_ITEMS = 10;
 
 /**
+ * TikTok's photo-carousel bounds. **Not the same numbers as Instagram's, and
+ * not the same endpoint** — see `lib/scheduler/adapters/tiktok.ts`.
+ *
+ * The maximum is documented: TikTok's photo reference says "an array containing
+ * up to 35 photo content URLs" (research 2026-08-08).
+ *
+ * The minimum is OURS, exactly like `CAROUSEL_MIN_ITEMS`. TikTok documents no
+ * floor, so whether a one-image PHOTO post is legal is unknown — and the honest
+ * default for an unknown is the value we can defend. `.dev/probe-tiktok-photo.ts`
+ * settles it with a MEDIA_UPLOAD init that publishes nothing; if 1 works, lower
+ * this and nothing else.
+ */
+export const TIKTOK_PHOTO_MIN_ITEMS = 2;
+export const TIKTOK_PHOTO_MAX_ITEMS = 35;
+
+/**
+ * The most files any one platform will take, and therefore the outer bound on
+ * the API's media array.
+ *
+ * Derived, never written down twice: this used to be Instagram's 10 spelled as
+ * a literal, on the assumption that it was "the largest any platform accepts".
+ * TikTok's 35 ended that. The per-target `validateMediaForPlatform` call is what
+ * enforces the real limit — this only stops an unbounded array reaching it.
+ */
+export const MAX_MEDIA_ITEMS = Math.max(
+  CAROUSEL_MAX_ITEMS,
+  TIKTOK_PHOTO_MAX_ITEMS
+);
+
+/**
  * How many files each post type takes, and of what kind.
  *
  * Enforced at the API before anything is written, because the alternative is
@@ -228,6 +262,14 @@ export const MEDIA_SHAPE_BY_POST_TYPE: Record<
   },
   SHORT: { minItems: 1, maxItems: 1, kinds: ["VIDEO"] },
   TIKTOK_VIDEO: { minItems: 1, maxItems: 1, kinds: ["VIDEO"] },
+  // Stills only. TikTok's photo endpoint takes `photo_images`, and there is no
+  // documented way to mix a video into one — a video going to TikTok is a
+  // TIKTOK_VIDEO post, which is a different endpoint entirely.
+  TIKTOK_PHOTO: {
+    minItems: TIKTOK_PHOTO_MIN_ITEMS,
+    maxItems: TIKTOK_PHOTO_MAX_ITEMS,
+    kinds: ["IMAGE"],
+  },
   FACEBOOK_REEL: { minItems: 1, maxItems: 1, kinds: ["VIDEO"] },
   FACEBOOK_VIDEO: { minItems: 1, maxItems: 1, kinds: ["VIDEO"] },
 };

@@ -9,6 +9,7 @@ import { getPublishQueue } from "@/lib/queue/client";
 import { getAdapter } from "@/lib/scheduler/adapters";
 import {
   PLATFORM_CONSTRAINTS,
+  validateCaptionForPlatform,
   validateMediaForPlatform,
   validateScheduleWindow,
 } from "@/lib/scheduler/constraints";
@@ -23,7 +24,7 @@ import {
   type MediaUserTagInput,
 } from "@/lib/scheduler/media-input";
 import {
-  CAROUSEL_MAX_ITEMS,
+  MAX_MEDIA_ITEMS,
   MEDIA_TYPE_BY_PLATFORM,
   SCHEDULED_POST_TYPES,
 } from "@/lib/scheduler/types";
@@ -48,7 +49,7 @@ const patchSchema = z.object({
    * Partial edits are not offered on purpose — positions must stay contiguous,
    * and "replace everything" is the only operation that cannot leave a gap.
    */
-  media: z.array(mediaItemSchema).min(1).max(CAROUSEL_MAX_ITEMS).optional(),
+  media: z.array(mediaItemSchema).min(1).max(MAX_MEDIA_ITEMS).optional(),
 });
 
 interface NewMediaItem {
@@ -244,6 +245,20 @@ export async function PATCH(
   if (!MEDIA_TYPE_BY_PLATFORM[platform].includes(mediaType)) {
     return NextResponse.json(
       { success: false, error: `${mediaType} is not valid for this platform` },
+      { status: 400 }
+    );
+  }
+
+  // Against the caption this save would leave in place, not just a supplied
+  // one — the same check the create route runs, because a rule enforced on
+  // create and not on edit is worse than no rule.
+  const captionIssue = validateCaptionForPlatform(
+    platform,
+    body.caption ?? post.caption
+  );
+  if (captionIssue) {
+    return NextResponse.json(
+      { success: false, error: captionIssue },
       { status: 400 }
     );
   }

@@ -15,11 +15,17 @@ import type {
 } from "@/app/generated/prisma/client";
 // Ratio naming lives with the rest of the aspect maths so the composer and
 // this validator cannot disagree about what "4:5" means.
-import { INSTAGRAM_MAX_WIDTH_PX, describeRatio } from "@/lib/media/aspect";
+import {
+  INSTAGRAM_MAX_WIDTH_PX,
+  TIKTOK_MAX_WIDTH_PX,
+  describeRatio,
+} from "@/lib/media/aspect";
 import {
   CAROUSEL_MAX_ITEMS,
   CAROUSEL_MIN_ITEMS,
   MEDIA_SHAPE_BY_POST_TYPE,
+  TIKTOK_PHOTO_MAX_ITEMS,
+  TIKTOK_PHOTO_MIN_ITEMS,
 } from "@/lib/scheduler/types";
 
 export interface PlatformConstraints {
@@ -59,6 +65,15 @@ export interface PlatformConstraints {
     maxItems: number;
     allowsVideo: boolean;
   };
+  /**
+   * Longest caption the platform accepts, where it documents one and rejects
+   * past it.
+   *
+   * Set only for TikTok so far: its photo posts cap `description` at 4000 while
+   * our own schema allows 5000. Instagram's limit is higher than anything the
+   * API accepts, so there is nothing to check there.
+   */
+  maxCaptionChars?: number;
   /** Rolling-24h publish cap, where the platform documents one. */
   dailyPostCap?: number;
   /** Minimum lead time we require between "now" and the scheduled minute. */
@@ -148,17 +163,43 @@ export const PLATFORM_CONSTRAINTS: Record<SocialPlatform, PlatformConstraints> =
     // Fully documented in TikTok's media transfer guide.
     TIKTOK: {
       videoMimeTypes: ["video/mp4", "video/quicktime", "video/webm"],
-      imageMimeTypes: [],
+      // Documented, unlike Instagram's: the transfer guide names WebP and JPEG
+      // as the accepted photo formats. PNG is absent from that list, so it is
+      // absent here — the composer converts to JPEG anyway.
+      imageMimeTypes: ["image/jpeg", "image/webp"],
       maxDurationSeconds: 600,
       maxFileBytes: 4 * GB,
+      // Documented at 20 MB per image — well above Instagram's 8 MB, so a photo
+      // set prepared for Instagram is always inside this.
+      maxImageBytes: 20 * MIB,
+      // "Maximum 1080p", and we do not know whether TikTok rejects or downscales
+      // past it. A RENDER TARGET, not a rejection: nothing validates against
+      // this, because refusing a file the user already prepared for Instagram
+      // would be punishing them for TikTok's lower ceiling. The composer derives
+      // a narrower copy for TikTok instead. See TIKTOK_MAX_WIDTH_PX.
+      maxImageWidthPx: TIKTOK_MAX_WIDTH_PX,
+      // No `imageAspectRatioRange` on purpose. That field exists only for
+      // platforms that REJECT out-of-range stills, and no official TikTok
+      // still-image range was found (research 2026-08-08). Adding a guessed one
+      // would refuse pictures TikTok would have published.
       minFrameRate: 23,
       maxFrameRate: 60,
+      carousel: {
+        minItems: TIKTOK_PHOTO_MIN_ITEMS,
+        maxItems: TIKTOK_PHOTO_MAX_ITEMS,
+        allowsVideo: false,
+      },
+      // Documented on the photo reference: `description` takes 4000 UTF-16
+      // runes. Our own caption field allows 5000, so without this a caption
+      // between the two schedules cleanly and fails at the scheduled minute.
+      maxCaptionChars: 4000,
       dailyPostCap: 15,
       minLeadTimeMinutes: 5,
       maxLeadTimeDays: 365,
       notes: [
         "TikTok has no scheduling API — OpenReply's worker uploads at the scheduled minute.",
-        "Around 15 posts per creator per 24 hours, shared across every app that posts for them.",
+        "Around 15 posts per creator per 24 hours, shared across every app that posts for them. A photo carousel counts as one.",
+        "Photo posts are fetched FROM this server, so its domain must be verified in your TikTok app — see docs/setup.md.",
       ],
     },
 
@@ -213,6 +254,28 @@ export function validateScheduleWindow(
   }
 
   return null;
+}
+
+/**
+ * Whether this caption fits the platform, in words the user can act on.
+ *
+ * Separate from `validateMediaForPlatform` because it is not about the files,
+ * and separate from the zod schema because the limit is per PLATFORM, not per
+ * request — the same 4500-character caption is fine for Instagram and refused
+ * by TikTok, and lowering the schema's cap to the strictest platform would
+ * punish every other one.
+ *
+ * Called from both scheduler routes. A rule enforced on create and not on edit
+ * is the exact failure `SCHEDULED_POST_TYPES` was extracted to prevent.
+ */
+export function validateCaptionForPlatform(
+  platform: SocialPlatform,
+  caption: string
+): string | null {
+  const limit = PLATFORM_CONSTRAINTS[platform].maxCaptionChars;
+  if (limit === undefined || caption.length <= limit) return null;
+
+  return `This platform caps the caption at ${limit} characters — yours is ${caption.length}`;
 }
 
 export interface MediaItemForValidation {

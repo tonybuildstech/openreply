@@ -384,6 +384,7 @@ export default function EditScheduledPostPage() {
                 platform={post.connectedAccount.platform}
                 mediaType={mediaType}
                 value={options}
+                photoCount={post.media.length}
                 tiktokPostMode={post.connectedAccount.tiktokPostMode}
                 onChange={(patch) =>
                   setOptions((current) => ({ ...current, ...patch }))

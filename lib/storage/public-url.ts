@@ -1,18 +1,25 @@
 /**
  * Short-lived, signed public URLs for stored media.
  *
- * Instagram's Reels container is created from a `video_url` that *Meta's*
- * servers fetch (the documented `upload_type=resumable` binary path is silently
- * ignored on `graph.instagram.com` — see the note at the top of
- * `lib/scheduler/adapters/instagram.ts`). So the file has to be reachable from
- * the public internet for the length of one publish.
+ * Two platforms need this, for the same reason and with different deadlines:
  *
- * Meta's fetcher cannot authenticate, so the URL itself is the credential: an
- * HMAC over the storage key and an expiry. Unguessable, unforgeable without the
- * server secret, and dead within `DEFAULT_TTL_MS`.
+ *  - **Instagram** creates its container from a `video_url` that *Meta's*
+ *    servers fetch (the documented `upload_type=resumable` binary path is
+ *    silently ignored on `graph.instagram.com` — see the note at the top of
+ *    `lib/scheduler/adapters/instagram.ts`).
+ *  - **TikTok photo carousels** support `PULL_FROM_URL` and nothing else, so
+ *    every image in a 35-photo post is fetched from here. TikTok additionally
+ *    requires the domain or URL prefix to be verified in its developer console,
+ *    and follows no redirects — which this route satisfies by serving the bytes
+ *    directly.
+ *
+ * Either way the file has to be reachable from the public internet for the
+ * length of one publish, and neither fetcher can authenticate — so the URL
+ * itself is the credential: an HMAC over the storage key and an expiry.
+ * Unguessable, unforgeable without the server secret, and dead on time.
  *
  * The storage key never appears in the URL in readable form — it embeds a
- * workspace ID, and these URLs end up in Meta's request logs.
+ * workspace ID, and these URLs end up in the platforms' request logs.
  */
 
 import { createHmac, timingSafeEqual } from "node:crypto";
@@ -76,12 +83,12 @@ export function buildSignedMediaUrl(
     hostname.endsWith(".local")
   ) {
     throw new Error(
-      `NEXTAUTH_URL is ${base}. Instagram fetches the video from this app, so it must be a public HTTPS URL — a tunnel or the deployed domain.`
+      `NEXTAUTH_URL is ${base}. The platform fetches this media from the app, so it must be a public HTTPS URL — a tunnel or the deployed domain.`
     );
   }
   if (protocol !== "https:") {
     throw new Error(
-      `NEXTAUTH_URL is ${base}. Instagram only fetches media over HTTPS.`
+      `NEXTAUTH_URL is ${base}. Media is only fetched over HTTPS.`
     );
   }
 

@@ -13,6 +13,7 @@ import {
 import {
   PLATFORM_CONSTRAINTS,
   type MediaItemForValidation,
+  validateCaptionForPlatform,
   validateMediaForPlatform,
   validateScheduleWindow,
 } from "../lib/scheduler/constraints";
@@ -303,6 +304,95 @@ describe("media validation", () => {
     ] as const) {
       expect(validateMediaForPlatform(platform, postType, [image()])).not.toBeNull();
     }
+  });
+
+  describe("TikTok photo carousels", () => {
+    it("accepts a JPEG set as a TikTok photo post", () => {
+      expect(
+        validateMediaForPlatform("TIKTOK", "TIKTOK_PHOTO", [image(), image()])
+      ).toBeNull();
+    });
+
+    it("accepts up to 35, and refuses the 36th", () => {
+      const many = (count: number) => Array.from({ length: count }, image);
+
+      expect(
+        validateMediaForPlatform("TIKTOK", "TIKTOK_PHOTO", many(35))
+      ).toBeNull();
+      expect(
+        validateMediaForPlatform("TIKTOK", "TIKTOK_PHOTO", many(36))
+      ).toMatch(/between 2 and 35/);
+      // ...and the same 35 are far too many for an Instagram carousel. This
+      // pair IS the composer's "min across the ticked platforms" rule.
+      expect(
+        validateMediaForPlatform("INSTAGRAM", "CAROUSEL", many(35))
+      ).toMatch(/between 2 and 10/);
+    });
+
+    it("takes WebP, which Instagram will not", () => {
+      const webp = [
+        image({ mimeType: "image/webp" }),
+        image({ mimeType: "image/webp" }),
+      ];
+
+      expect(
+        validateMediaForPlatform("TIKTOK", "TIKTOK_PHOTO", webp)
+      ).toBeNull();
+      expect(validateMediaForPlatform("INSTAGRAM", "CAROUSEL", webp)).toMatch(
+        /image\/jpeg/
+      );
+    });
+
+    it("refuses a video in a photo post", () => {
+      expect(
+        validateMediaForPlatform("TIKTOK", "TIKTOK_PHOTO", [image(), video()])
+      ).toMatch(/cannot contain/);
+    });
+
+    it("does not check aspect ratio, because TikTok documents no range", () => {
+      // Instagram REJECTS 9:16 stills; TikTok publishes them. Checking a
+      // guessed range here would refuse pictures TikTok would have taken.
+      const tall = [
+        image({ widthPx: 1080, heightPx: 1920 }),
+        image({ widthPx: 1080, heightPx: 1920 }),
+      ];
+
+      expect(
+        validateMediaForPlatform("TIKTOK", "TIKTOK_PHOTO", tall)
+      ).toBeNull();
+      expect(validateMediaForPlatform("INSTAGRAM", "CAROUSEL", tall)).toMatch(
+        /outside the 4:5 to 1.91:1 range/
+      );
+    });
+
+    it("allows an image Instagram's 8 MB cap would refuse", () => {
+      // TikTok's ceiling is 20 MB. A photo set prepared for Instagram is always
+      // inside it, but a TikTok-only post is not held to Instagram's limit.
+      const big = [
+        image({ sizeBytes: 12 * 1024 * 1024 }),
+        image({ sizeBytes: 12 * 1024 * 1024 }),
+      ];
+
+      expect(validateMediaForPlatform("TIKTOK", "TIKTOK_PHOTO", big)).toBeNull();
+      expect(validateMediaForPlatform("INSTAGRAM", "CAROUSEL", big)).toMatch(
+        /8 MB limit/
+      );
+    });
+  });
+
+  describe("caption length", () => {
+    it("refuses a TikTok caption past 4000 and allows the same one elsewhere", () => {
+      const long = "x".repeat(4001);
+
+      // Our own schema allows 5000, so without this the post schedules cleanly
+      // and fails in the worker at the scheduled minute.
+      expect(validateCaptionForPlatform("TIKTOK", long)).toMatch(/4000/);
+      expect(validateCaptionForPlatform("INSTAGRAM", long)).toBeNull();
+    });
+
+    it("allows a caption exactly at the limit", () => {
+      expect(validateCaptionForPlatform("TIKTOK", "x".repeat(4000))).toBeNull();
+    });
   });
 
   it("accepts a JPEG as an Instagram image post", () => {

@@ -7,6 +7,11 @@
  */
 
 import type { ScheduledPostMediaType } from "@/app/generated/prisma/client";
+import {
+  CAROUSEL_MAX_ITEMS,
+  TIKTOK_PHOTO_MAX_ITEMS,
+  TIKTOK_PHOTO_MIN_ITEMS,
+} from "@/lib/scheduler/types";
 
 export type PlatformKey =
   | "INSTAGRAM"
@@ -62,7 +67,12 @@ export const PLATFORM_META: Record<PlatformKey, PlatformMeta> = {
   TIKTOK: {
     label: "TikTok",
     slug: "tiktok",
-    mediaTypes: [{ value: "TIKTOK_VIDEO", label: "Video" }],
+    // Like Instagram's, these are DERIVED from the files rather than offered as
+    // a menu — and they are two different endpoints, not two labels for one.
+    mediaTypes: [
+      { value: "TIKTOK_VIDEO", label: "Video" },
+      { value: "TIKTOK_PHOTO", label: "Photo carousel" },
+    ],
     scheduling: "worker",
     schedulingNote:
       "TikTok has no scheduling API. OpenReply's worker uploads at the scheduled minute, so the worker must be running.",
@@ -90,6 +100,13 @@ export function derivePostType(
     if (kinds.length > 1) return "CAROUSEL";
     return kinds[0] === "IMAGE" ? "IMAGE" : "REEL";
   }
+  if (platform === "TIKTOK") {
+    // Stills and video go to different endpoints, so this is not cosmetic: get
+    // it wrong and the adapter builds a chunked upload body for a photo set.
+    return kinds.length > 0 && kinds.every((kind) => kind === "IMAGE")
+      ? "TIKTOK_PHOTO"
+      : "TIKTOK_VIDEO";
+  }
   if (platform === "FACEBOOK_PAGE") {
     // Only two values are valid here, so this narrows rather than trusting
     // whatever string the caller happened to be holding.
@@ -99,11 +116,33 @@ export function derivePostType(
 }
 
 /**
+ * The most files this platform will take for the current selection.
+ *
+ * Instagram and TikTok disagree — 10 against 35 — so there is no single
+ * composer-wide ceiling any more, and the effective cap is the SMALLEST of the
+ * selected platforms'. A number returned here is a promise the API will keep;
+ * `validateMediaForPlatform` enforces the same limits server-side.
+ */
+export function maxItemsFor(
+  platform: PlatformKey,
+  kinds: ReadonlyArray<"IMAGE" | "VIDEO">
+): number {
+  if (platform === "INSTAGRAM") return CAROUSEL_MAX_ITEMS;
+  if (platform === "TIKTOK") {
+    return derivePostType("TIKTOK", kinds) === "TIKTOK_PHOTO"
+      ? TIKTOK_PHOTO_MAX_ITEMS
+      : 1;
+  }
+  return 1;
+}
+
+/**
  * Why this platform cannot take the current selection, or null.
  *
- * Only Instagram accepts a still or more than one file. Saying so up front is
- * what keeps the fan-out honest — the alternative is a post that publishes one
- * arbitrary frame of a carousel to TikTok and calls it a success.
+ * Instagram and TikTok both accept stills and multi-item posts; YouTube and
+ * Facebook take exactly one video. Saying so up front is what keeps the fan-out
+ * honest — the alternative is a post that publishes one arbitrary frame of a
+ * carousel and calls it a success.
  */
 export function selectionBlocker(
   platform: PlatformKey,
@@ -112,8 +151,32 @@ export function selectionBlocker(
   if (platform === "INSTAGRAM" || kinds.length === 0) return null;
 
   const label = PLATFORM_META[platform].label;
+
+  if (platform === "TIKTOK") {
+    const images = kinds.filter((kind) => kind === "IMAGE").length;
+    const videos = kinds.length - images;
+
+    // Photos and video are separate endpoints with separate bodies. There is no
+    // documented way to put a video inside a photo carousel.
+    if (images > 0 && videos > 0) {
+      return `${label} takes either photos or one video in a post, not both.`;
+    }
+    if (videos > 1) {
+      return `${label} publishes one video per post.`;
+    }
+    if (images > 0 && images < TIKTOK_PHOTO_MIN_ITEMS) {
+      // Ours, not TikTok's: the docs state no floor, so we hold to the value we
+      // can defend until `.dev/probe-tiktok-photo.ts` settles it.
+      return `A ${label} photo post needs at least ${TIKTOK_PHOTO_MIN_ITEMS} photos.`;
+    }
+    if (images > TIKTOK_PHOTO_MAX_ITEMS) {
+      return `${label} takes at most ${TIKTOK_PHOTO_MAX_ITEMS} photos in one post.`;
+    }
+    return null;
+  }
+
   if (kinds.length > 1) {
-    return `${label} takes a single video — schedule the carousel to Instagram on its own.`;
+    return `${label} takes a single video — schedule the carousel to Instagram or TikTok on its own.`;
   }
   if (kinds[0] === "IMAGE") {
     return `${label} does not accept photos through the API, only video.`;

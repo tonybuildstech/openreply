@@ -517,6 +517,11 @@ enum ScheduledPostMediaType {
   CAROUSEL
   SHORT
   TIKTOK_VIDEO
+  // A TikTok photo carousel: 1-35 stills, published through
+  // /v2/post/publish/content/init/ rather than the video endpoint. Separate
+  // from CAROUSEL because the limits and the API path share nothing with
+  // Instagram's — 35 items vs 10, and TikTok pulls the files from us.
+  TIKTOK_PHOTO
   FACEBOOK_REEL
   FACEBOOK_VIDEO
 }

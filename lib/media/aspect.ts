@@ -363,6 +363,25 @@ export const INSTAGRAM_MAX_WIDTH_PX = 1440;
 export const INSTAGRAM_MIN_WIDTH_PX = 320;
 
 /**
+ * The widest still we send TikTok.
+ *
+ * TikTok's media transfer guide caps photo posts at "maximum 1080p" without
+ * saying whether it rejects or downscales past it — unlike Instagram, whose
+ * "will be scaled down to the maximum if necessary" is explicit. So this is
+ * treated as a hard ceiling until `.dev/probe-tiktok-photo.ts` says otherwise.
+ *
+ * **It is a render target, never a rejection.** It is lower than Instagram's
+ * 1440, and the answer to that is NOT to publish a worse picture to Instagram:
+ * the composer prepares Instagram's file at full quality and derives a separate,
+ * narrower copy for TikTok when this cap requires one. Two files, one crop —
+ * which is why `CropFocus` is stored as fractions rather than pixels.
+ *
+ * If the probe comes back saying TikTok downscales, raise this and the derive
+ * step stops firing on its own.
+ */
+export const TIKTOK_MAX_WIDTH_PX = 1080;
+
+/**
  * Scale `width`×`height` down to fit `maxWidth`, preserving the ratio.
  *
  * Returns the input untouched when it already fits — upscaling a small image to

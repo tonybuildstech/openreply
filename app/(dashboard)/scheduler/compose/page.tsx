@@ -39,12 +39,16 @@ import { probeMedia } from "@/lib/media/probe";
 import {
   CENTRED_FOCUS,
   FEED_PRESETS,
+  TIKTOK_MAX_WIDTH_PX,
   type AspectPreset,
   type CropFocus,
 } from "@/lib/media/aspect";
 import TagPeopleModal from "@/components/scheduler/tag-people-modal";
 import { MAX_TAGS_PER_ITEM } from "@/lib/scheduler/media-input";
-import { CAROUSEL_MAX_ITEMS } from "@/lib/scheduler/types";
+import {
+  CAROUSEL_MAX_ITEMS,
+  TIKTOK_PHOTO_MAX_ITEMS,
+} from "@/lib/scheduler/types";
 import type {
   ComposerAccount,
   ComposerTarget,
@@ -84,6 +88,7 @@ interface PlatformConstraint {
   maxImageBytes?: number;
   imageAspectRatioRange?: { min: number; max: number };
   carousel?: { minItems: number; maxItems: number; allowsVideo: boolean };
+  maxCaptionChars?: number;
   minLeadTimeMinutes: number;
   maxLeadTimeDays: number;
   notes: string[];
@@ -133,6 +138,8 @@ export default function ComposePage() {
   /** Media item whose tagging modal is open, if any. */
   const [taggingId, setTaggingId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  /** Rendering TikTok's narrower copies — can take a while for 35 photos. */
+  const [preparingTikTok, setPreparingTikTok] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<string[]>([]);
 
@@ -155,12 +162,75 @@ export default function ComposePage() {
   const instagramRange = constraints.INSTAGRAM?.imageAspectRatioRange;
   const instagramMaxImageBytes = constraints.INSTAGRAM?.maxImageBytes;
 
-  // Read from the constraints the API already sends rather than hardcoded
-  // here — that is what kept this in step with the server when the ceiling
-  // moved. CAROUSEL_MAX_ITEMS is only the fallback for the first render,
-  // before /api/scheduler/accounts has answered.
-  const maxItems =
-    constraints.INSTAGRAM?.carousel?.maxItems ?? CAROUSEL_MAX_ITEMS;
+  /** The platforms currently ticked, deduplicated — several accounts can share one. */
+  const selectedPlatforms = useMemo(() => {
+    const set = new Set<PlatformKey>();
+    for (const target of targets) {
+      const account = accountById.get(target.connectedAccountId);
+      if (account) set.add(account.platform);
+    }
+    return [...set];
+  }, [targets, accountById]);
+
+  /**
+   * How many files the current selection allows.
+   *
+   * There is no composer-wide ceiling any more: Instagram caps a carousel at
+   * 10 and TikTok a photo post at 35. The effective limit is the SMALLEST of
+   * the platforms actually ticked — and before anything is ticked it is the
+   * largest any of them would take, so a TikTok-only post can reach 35 without
+   * having to pick the account first.
+   *
+   * Read from the constraints the API sends rather than hardcoded here; the
+   * constants are only the fallback for the first render, before
+   * /api/scheduler/accounts has answered.
+   */
+  const maxItems = useMemo(() => {
+    const ceilingFor = (platform: PlatformKey) => {
+      if (platform === "INSTAGRAM") {
+        return constraints.INSTAGRAM?.carousel?.maxItems ?? CAROUSEL_MAX_ITEMS;
+      }
+      if (platform === "TIKTOK") {
+        // Only the PHOTO post type is multi-item; a video target caps at 1, and
+        // `selectionBlocker` explains that separately rather than silently
+        // shrinking the tray to one slot.
+        return mediaKinds.length > 0 && mediaKinds.every((k) => k === "IMAGE")
+          ? (constraints.TIKTOK?.carousel?.maxItems ?? TIKTOK_PHOTO_MAX_ITEMS)
+          : Number.POSITIVE_INFINITY;
+      }
+      return Number.POSITIVE_INFINITY;
+    };
+
+    const ceilings = selectedPlatforms.map(ceilingFor);
+    if (ceilings.length === 0) {
+      return Math.max(
+        constraints.INSTAGRAM?.carousel?.maxItems ?? CAROUSEL_MAX_ITEMS,
+        constraints.TIKTOK?.carousel?.maxItems ?? TIKTOK_PHOTO_MAX_ITEMS
+      );
+    }
+
+    const limit = Math.min(...ceilings);
+    return Number.isFinite(limit) ? limit : CAROUSEL_MAX_ITEMS;
+  }, [selectedPlatforms, constraints, mediaKinds]);
+
+  /** Which ticked platform is imposing `maxItems`, for an honest message. */
+  const capOwner = useMemo(() => {
+    if (selectedPlatforms.includes("INSTAGRAM") && maxItems === CAROUSEL_MAX_ITEMS) {
+      return "Instagram";
+    }
+    if (selectedPlatforms.includes("TIKTOK")) return "TikTok";
+    return null;
+  }, [selectedPlatforms, maxItems]);
+
+  /**
+   * Files loaded beyond what the current selection allows.
+   *
+   * Blocks submission rather than truncating. Ticking Instagram with 35 photos
+   * loaded has to say which ones must go — quietly publishing the first 10
+   * would be exactly the kind of silent damage the rest of this composer
+   * refuses to do.
+   */
+  const overCap = media.length > maxItems ? media.length - maxItems : 0;
 
   /** Items Instagram would reject outright until they are cropped or resized. */
   const blockedItems = useMemo(
@@ -253,7 +323,11 @@ export default function ComposePage() {
 
     const accepted = files.slice(0, room);
     if (accepted.length < files.length) {
-      setError(`Instagram allows at most ${maxItems} items in one post.`);
+      setError(
+        capOwner
+          ? `${capOwner} allows at most ${maxItems} items in one post.`
+          : `A post takes at most ${maxItems} items.`
+      );
     }
 
     const staged: ComposerMediaItem[] = accepted.map((file) => ({
@@ -665,6 +739,19 @@ export default function ComposePage() {
         }
       }
 
+      // Per platform, not per request: the same caption is fine for Instagram
+      // and too long for TikTok, so the shared field cannot carry one limit.
+      const effectiveCaption = target.caption || caption;
+      if (
+        constraint.maxCaptionChars &&
+        effectiveCaption.length > constraint.maxCaptionChars
+      ) {
+        push(
+          `${label}-caption`,
+          `${label} caps the caption at ${constraint.maxCaptionChars} characters — yours is ${effectiveCaption.length}.`
+        );
+      }
+
       if (minutesAhead < constraint.minLeadTimeMinutes) {
         push(
           `${label}-soon`,
@@ -681,7 +768,16 @@ export default function ComposePage() {
     }
 
     return list;
-  }, [media, mediaKinds, targets, scheduledAt, constraints, accountById, now]);
+  }, [
+    media,
+    mediaKinds,
+    targets,
+    caption,
+    scheduledAt,
+    constraints,
+    accountById,
+    now,
+  ]);
 
   /** TikTok Direct Post is invalid until the creator picks a privacy level. */
   const missingTikTokPrivacy = targets.some((target) => {
@@ -705,16 +801,125 @@ export default function ComposePage() {
     // An out-of-range still is a hard stop: Instagram rejects the container
     // rather than cropping, and that failure would land in the worker.
     blockedItems.length === 0 &&
+    // Over the cap the ticked platforms allow. Refused rather than truncated —
+    // the user decides which files go, not us.
+    overCap === 0 &&
     targets.length > 0 &&
     warnings.length === 0 &&
     !missingTikTokPrivacy &&
     !submitting;
+
+  /**
+   * The TikTok copy of the current photo set, or null when none is needed.
+   *
+   * TikTok caps stills at 1080px where Instagram takes 1440, and the answer to
+   * that is NOT to publish a worse picture to Instagram. So each photo that is
+   * too wide is re-rendered from the ORIGINAL file at TikTok's ceiling — same
+   * crop, same focus, so the two renditions are the same picture — uploaded as
+   * a separate object, and handed to the TikTok target alone.
+   *
+   * Returns null when every photo already fits, which is the common case for
+   * anything shot vertically. Then both targets share one file and nothing is
+   * re-encoded at all.
+   *
+   * Runs at submit rather than on every crop change: a 35-photo set would
+   * otherwise re-render twice for each nudge of the crop handle.
+   */
+  async function buildTikTokMedia(): Promise<
+    Array<Record<string, unknown>> | null
+  > {
+    const needsCopy = media.some(
+      (item) =>
+        item.kind === "IMAGE" &&
+        (item.outputWidthPx ?? 0) > TIKTOK_MAX_WIDTH_PX
+    );
+    if (!needsCopy) return null;
+
+    const tiktokMaxImageBytes = constraints.TIKTOK?.maxImageBytes;
+    const prepared: Array<Record<string, unknown>> = [];
+
+    for (const item of media) {
+      // Already inside TikTok's ceiling: reuse the exact same object rather
+      // than re-encoding it to the same size for no gain.
+      if (
+        item.kind !== "IMAGE" ||
+        (item.outputWidthPx ?? 0) <= TIKTOK_MAX_WIDTH_PX
+      ) {
+        prepared.push({
+          storageKey: item.storageKey as string,
+          ...(item.outputWidthPx ? { widthPx: item.outputWidthPx } : {}),
+          ...(item.outputHeightPx ? { heightPx: item.outputHeightPx } : {}),
+          ...(item.croppedToRatio
+            ? { croppedToRatio: item.croppedToRatio }
+            : {}),
+        });
+        continue;
+      }
+
+      const preset =
+        FEED_PRESETS.find((option) => option.id === item.ratioId) ??
+        FEED_PRESETS[0];
+
+      const rendered = await prepareImage(item.file, {
+        targetRatio: preset.ratio,
+        // The same framing the user chose for Instagram. `CropFocus` is stored
+        // as fractions precisely so it survives the change of output size.
+        focus: item.focus,
+        ratioLabel: preset.label,
+        maxWidthPx: TIKTOK_MAX_WIDTH_PX,
+        maxBytes: tiktokMaxImageBytes,
+      });
+
+      const { storageKey } = await uploadBlob(
+        rendered.blob,
+        "image/jpeg",
+        item.file.name.replace(/\.[^.]+$/, "") + "-tiktok.jpg"
+      );
+
+      prepared.push({
+        storageKey,
+        widthPx: rendered.widthPx,
+        heightPx: rendered.heightPx,
+        ...(item.croppedToRatio ? { croppedToRatio: item.croppedToRatio } : {}),
+      });
+    }
+
+    return prepared;
+  }
 
   async function submit() {
     if (media.length === 0) return;
     setSubmitting(true);
     setError(null);
     setFieldErrors([]);
+
+    // Only built when a TikTok photo target is actually selected — deriving
+    // copies nobody asked for would double the upload for no reason.
+    const wantsTikTokPhotos = targets.some((target) => {
+      const account = accountById.get(target.connectedAccountId);
+      return (
+        account?.platform === "TIKTOK" &&
+        derivePostType("TIKTOK", mediaKinds) === "TIKTOK_PHOTO"
+      );
+    });
+
+    let tiktokMedia: Array<Record<string, unknown>> | null = null;
+    if (wantsTikTokPhotos) {
+      setPreparingTikTok(true);
+      try {
+        tiktokMedia = await buildTikTokMedia();
+      } catch (renderError) {
+        setPreparingTikTok(false);
+        setSubmitting(false);
+        setError(
+          renderError instanceof Error
+            ? `Could not prepare the TikTok copies: ${renderError.message}`
+            : "Could not prepare the TikTok copies"
+        );
+        return;
+      }
+      setPreparingTikTok(false);
+    }
 
     const res = await fetch("/api/scheduler/posts", {
       method: "POST",
@@ -739,19 +944,28 @@ export default function ComposePage() {
         })),
         caption,
         scheduledAt: new Date(scheduledAt).toISOString(),
-        targets: targets.map((target) => ({
-          connectedAccountId: target.connectedAccountId,
+        targets: targets.map((target) => {
+          const platform = accountById.get(
+            target.connectedAccountId
+          )!.platform;
           // Derived at submit rather than stored: adding a second photo turns
           // an Instagram photo post into a carousel, and a cached copy of the
           // post type would be the thing that goes stale.
-          mediaType: derivePostType(
-            accountById.get(target.connectedAccountId)!.platform,
-            mediaKinds,
-            target.mediaType
-          ),
-          caption: target.caption || undefined,
-          platformOptions: target.options,
-        })),
+          const mediaType = derivePostType(platform, mediaKinds, target.mediaType);
+
+          return {
+            connectedAccountId: target.connectedAccountId,
+            mediaType,
+            caption: target.caption || undefined,
+            platformOptions: target.options,
+            // TikTok's own, narrower renditions. Omitted entirely when the
+            // shared files already fit, so the usual single-upload path is
+            // untouched.
+            ...(mediaType === "TIKTOK_PHOTO" && tiktokMedia
+              ? { media: tiktokMedia }
+              : {}),
+          };
+        }),
       }),
     });
 
@@ -839,8 +1053,10 @@ export default function ComposePage() {
                   : "Add another"}
             </span>
             <span className="text-xs text-muted">
-              JPEG photos or MP4 / MOV / WebM video. Up to {maxItems} items —
-              two or more become an Instagram carousel.
+              JPEG photos or MP4 / MOV / WebM video. {media.length} of{" "}
+              {maxItems}
+              {capOwner ? ` — ${capOwner}'s limit` : ""}. Two or more photos
+              become a carousel.
             </span>
             <input
               type="file"
@@ -1096,6 +1312,7 @@ export default function ComposePage() {
                                   target.mediaType
                                 )}
                                 value={target.options}
+                                photoCount={media.length}
                                 tiktokPostMode={account.tiktokPostMode}
                                 onChange={(patch) =>
                                   updateOptions(account.id, patch)
@@ -1143,6 +1360,14 @@ export default function ComposePage() {
               choice.
             </p>
           )}
+          {overCap > 0 && (
+            <p className="text-sm text-error">
+              {capOwner ?? "This selection"} takes at most {maxItems} items, and
+              you have {media.length}. Remove {overCap}
+              {overCap === 1 ? " item" : " items"} — or untick{" "}
+              {capOwner ?? "that platform"} and post the rest on its own.
+            </p>
+          )}
           {error && <p className="text-sm text-error">{error}</p>}
           {fieldErrors.map((message) => (
             <p key={message} className="text-sm text-error">
@@ -1158,9 +1383,11 @@ export default function ComposePage() {
           disabled={!canSubmit}
           className="rounded-lg border border-border bg-surface px-5 py-2.5 text-sm font-medium transition hover:bg-background disabled:opacity-50"
         >
-          {submitting
-            ? "Scheduling…"
-            : `Schedule to ${targets.length} account${targets.length === 1 ? "" : "s"}`}
+          {preparingTikTok
+            ? "Preparing TikTok copies…"
+            : submitting
+              ? "Scheduling…"
+              : `Schedule to ${targets.length} account${targets.length === 1 ? "" : "s"}`}
         </button>
         <Link href="/scheduler" className="text-sm text-muted hover:underline">
           Cancel

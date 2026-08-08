@@ -5,6 +5,22 @@
  * API, and `upload_url` expires after one hour — so init MUST happen at fire
  * time, never in advance.
  *
+ * **Two endpoints, not one.** Video and photos share nothing but the status
+ * poll (research 2026-08-08):
+ *
+ *  - **Video** — `/post/publish/video/init/` or `/post/publish/inbox/video/init/`,
+ *    then the file is streamed to `upload_url` in chunks. `FILE_UPLOAD`.
+ *  - **Photo carousel** — `/post/publish/content/init/` with `media_type=PHOTO`,
+ *    up to 35 stills, and **`PULL_FROM_URL` only**: there is no photo
+ *    `FILE_UPLOAD`, so TikTok fetches every image FROM this server. That makes
+ *    the signed-URL layer in `lib/storage/public-url.ts` load-bearing, and it
+ *    means the app's domain must be verified in the TikTok developer console
+ *    or every init returns `url_ownership_unverified`.
+ *
+ * `/content/init/` is NOT a unified endpoint — TikTok documents no
+ * `media_type=VIDEO` for it and has announced no sunset for `/video/init/`, so
+ * the video path below stays exactly where it is.
+ *
  * Two post modes, because research (2026-08-06) found Direct Post is probably
  * out of reach here:
  *
@@ -19,6 +35,13 @@
  *
  * Inbox is the default precisely because an unaudited Direct Post silently
  * produces a private video the creator never asked for.
+ *
+ * For photos the same split reads as INBOX → `MEDIA_UPLOAD`, and the default is
+ * even easier to defend: an unaudited Direct Post is private AND carries a
+ * track TikTok chose, whereas finishing in the app gives the creator a public
+ * post and any sound they like. There is no API for picking a sound — the only
+ * music field in the whole Content Posting API is `auto_add_music`, a boolean
+ * that asks TikTok to pick one, and it works on Direct Post alone.
  *
  * The composer captures TikTok's mandatory UX (creator_info, an explicitly
  * chosen privacy level, interaction toggles, commercial disclosure) at schedule
@@ -35,11 +58,14 @@ import { resolveAccessToken } from "@/lib/scheduler/tokens";
 import {
   PublishError,
   requireSingleMedia,
+  TIKTOK_PHOTO_MAX_ITEMS,
   type PublishAdapter,
+  type PublishResult,
   type PublishStatus,
   type ScheduledPostWithMedia,
 } from "@/lib/scheduler/types";
 import { getMediaStorage } from "@/lib/storage";
+import { buildSignedMediaUrl } from "@/lib/storage/public-url";
 
 const API_BASE = "https://open.tiktokapis.com/v2";
 
@@ -48,6 +74,26 @@ const API_BASE = "https://open.tiktokapis.com/v2";
 const MIN_CHUNK_BYTES = 5 * 1024 * 1024;
 const MAX_CHUNK_BYTES = 64 * 1024 * 1024;
 const MAX_CHUNKS = 1000;
+
+/**
+ * How long the signed image URLs stay alive for a photo carousel.
+ *
+ * Longer than the 2 h default `buildSignedMediaUrl` gives Instagram, because
+ * TikTok's guarantee is weaker: the docs promise only that the URL must remain
+ * reachable "for the entire duration of the download process, which times out
+ * one hour after the download task is initiated", say nothing about whether it
+ * re-fetches later, and say nothing about how many of the 35 it pulls at once.
+ * Four hours is one download window plus room for a worker retry.
+ *
+ * The URLs are deliberately NOT single-use for the same reason — nothing in the
+ * docs promises TikTok fetches each image exactly once.
+ */
+const PHOTO_URL_TTL_MS = 4 * 60 * 60 * 1000;
+
+/** TikTok's documented ceiling on a photo post's description. */
+const MAX_DESCRIPTION_CHARS = 4000;
+/** ...and on its title. Both are counted in UTF-16 runes. */
+const MAX_TITLE_CHARS = 90;
 
 export type TikTokPostMode = "INBOX" | "DIRECT_POST";
 
@@ -60,13 +106,39 @@ export interface TikTokAccountMetadata {
 
 export interface TikTokPostOptions {
   /** Chosen by the user in the composer — TikTok forbids a default. */
-  privacyLevel?: "PUBLIC_TO_EVERYONE" | "MUTUAL_FOLLOW_FRIENDS" | "SELF_ONLY";
+  privacyLevel?:
+    | "PUBLIC_TO_EVERYONE"
+    | "MUTUAL_FOLLOW_FRIENDS"
+    | "FOLLOWER_OF_CREATOR"
+    | "SELF_ONLY";
   disableComment?: boolean;
+  /** Video only — TikTok's photo endpoint documents neither. */
   disableDuet?: boolean;
   disableStitch?: boolean;
   videoCoverTimestampMs?: number;
   brandContentToggle?: boolean;
   brandOrganicToggle?: boolean;
+
+  // --- Photo carousels only ---
+
+  /**
+   * Photo posts carry a title AND a description; video carries only a title.
+   * The post's caption becomes the description (that is where TikTok's own
+   * example puts hashtags and mentions), so this is the separate short headline
+   * and is omitted entirely when the composer collected none.
+   */
+  title?: string;
+  /**
+   * Which image is the cover. Zero-based, and not necessarily the first — hence
+   * a stored choice rather than a hardcoded 0.
+   */
+  photoCoverIndex?: number;
+  /**
+   * Ask TikTok to attach a recommended track. **This is not a track picker** —
+   * no such API exists — and it works on Direct Post only. The creator can
+   * change whatever TikTok chose, in the app, after the fact.
+   */
+  autoAddMusic?: boolean;
 }
 
 /**
@@ -125,10 +197,22 @@ async function tiktokRequest(
       code === "spam_risk_text" ||
       code === "spam_risk" ||
       code === "access_token_invalid" ||
-      code === "scope_not_authorized";
+      code === "scope_not_authorized" ||
+      // Photo carousels only: TikTok will not fetch media from a domain that
+      // has not been verified in the developer console. Retrying cannot fix a
+      // configuration problem, and the message has to say where to go.
+      code === "url_ownership_unverified" ||
+      // Unaudited clients may only post for a handful of creators a day.
+      code === "reached_active_user_cap" ||
+      code === "unaudited_client_can_only_post_to_private_accounts";
+
+    const message =
+      code === "url_ownership_unverified"
+        ? `${context}: TikTok will not fetch media from this server. Verify this app's domain or the URL prefix /api/media/public/ in the TikTok developer console — see docs/setup.md.`
+        : `${context}: ${payload.error?.message ?? code ?? `HTTP ${response.status}`}`;
 
     throw new PublishError(
-      `${context}: ${payload.error?.message ?? code ?? `HTTP ${response.status}`}`,
+      message,
       !permanent && (response.status >= 500 || response.status === 429),
       {
         needsReauth:
@@ -200,6 +284,119 @@ async function uploadChunks(
   }
 }
 
+/**
+ * Publish a photo carousel — `/post/publish/content/init/`, `PULL_FROM_URL`.
+ *
+ * Nothing is uploaded here. TikTok is handed signed HTTPS links and fetches the
+ * images itself, so this holds no file bytes at all — which suits the worker's
+ * 250 MB cap far better than the chunked video path does.
+ */
+async function schedulePhotoCarousel(
+  post: ScheduledPostWithMedia,
+  account: ConnectedAccount,
+  accessPlaintextToken: string,
+  metadata: TikTokAccountMetadata,
+  options: TikTokPostOptions
+): Promise<PublishResult> {
+  if (post.media.length === 0) {
+    throw new PublishError("This post has no media attached", false);
+  }
+  if (post.media.length > TIKTOK_PHOTO_MAX_ITEMS) {
+    throw new PublishError(
+      `TikTok takes at most ${TIKTOK_PHOTO_MAX_ITEMS} photos in one post — this one has ${post.media.length}`,
+      false
+    );
+  }
+  if (post.caption.length > MAX_DESCRIPTION_CHARS) {
+    throw new PublishError(
+      `TikTok caps a photo post's description at ${MAX_DESCRIPTION_CHARS} characters — this caption is ${post.caption.length}`,
+      false
+    );
+  }
+
+  const isDirect = (metadata.postMode ?? "INBOX") === "DIRECT_POST";
+
+  // Clamped rather than trusted: a stored index left over from an edit that
+  // removed items would otherwise be rejected by TikTok as out of range.
+  const coverIndex = Math.min(
+    Math.max(options.photoCoverIndex ?? 0, 0),
+    post.media.length - 1
+  );
+
+  // Media rows arrive ordered by `position`, and that order IS the order the
+  // viewer swipes through.
+  const photoImages = post.media.map((item) =>
+    buildSignedMediaUrl(item.storageKey, PHOTO_URL_TTL_MS)
+  );
+
+  const title = options.title?.slice(0, MAX_TITLE_CHARS);
+
+  const initBody = {
+    media_type: "PHOTO",
+    post_mode: isDirect ? "DIRECT_POST" : "MEDIA_UPLOAD",
+    post_info: {
+      ...(title ? { title } : {}),
+      description: post.caption,
+      // Everything below is documented as Direct Post only. On the inbox path
+      // the creator makes these choices in the TikTok app, and sending them
+      // would claim a decision the user never made.
+      //
+      // Note what is NOT here: `disable_duet`, `disable_stitch` and
+      // `video_cover_timestamp_ms` are video-only fields, and TikTok does not
+      // document whether an extraneous field is ignored or rejected. They are
+      // omitted rather than sent as `false`.
+      ...(isDirect
+        ? {
+            privacy_level: options.privacyLevel ?? "SELF_ONLY",
+            disable_comment: options.disableComment ?? false,
+            auto_add_music: options.autoAddMusic ?? false,
+            // The photo reference marks both required while its own example
+            // omits them. Explicit booleans satisfy either reading.
+            brand_content_toggle: options.brandContentToggle ?? false,
+            brand_organic_toggle: options.brandOrganicToggle ?? false,
+          }
+        : {}),
+    },
+    source_info: {
+      // The only mode photos support — there is no photo FILE_UPLOAD.
+      source: "PULL_FROM_URL",
+      photo_images: photoImages,
+      photo_cover_index: coverIndex,
+    },
+  };
+
+  const init = await tiktokRequest(
+    "/post/publish/content/init/",
+    accessPlaintextToken,
+    initBody,
+    isDirect ? "TikTok photo post init" : "TikTok photo upload init"
+  );
+
+  // No `upload_url` on this path — there is nothing to upload to.
+  const publishId = init.publish_id as string | undefined;
+  if (!publishId) {
+    throw new PublishError("TikTok did not return a publish ID", true, {
+      responseSnippet: toResponseSnippet(init),
+    });
+  }
+
+  await recordQuotaUsage({
+    platform: "TIKTOK",
+    connectedAccountId: account.id,
+    // One publish action however many photos it carries, which is also how
+    // TikTok counts it against the per-creator daily cap.
+    posts: 1,
+  });
+
+  const notice = isDirect
+    ? metadata.auditApproved
+      ? undefined
+      : "Posted privately (SELF_ONLY). TikTok restricts every post from an unaudited app to private — open TikTok to change its visibility."
+    : "Sent to your TikTok inbox. Open the TikTok app to choose a sound and finish posting.";
+
+  return { containerId: publishId, notice };
+}
+
 export const tiktokAdapter: PublishAdapter = {
   platform: "TIKTOK",
   dispatchMode: "QUEUED",
@@ -208,8 +405,21 @@ export const tiktokAdapter: PublishAdapter = {
     const accessPlaintextToken = await resolveAccessToken(account);
     const metadata = (account.metadata ?? {}) as TikTokAccountMetadata;
     const options = (post.platformOptions ?? {}) as TikTokPostOptions;
+
+    // Photos are a different endpoint, a different transfer mode and a
+    // different field set. Branch before anything video-shaped happens.
+    if (post.mediaType === "TIKTOK_PHOTO") {
+      return schedulePhotoCarousel(
+        post,
+        account,
+        accessPlaintextToken,
+        metadata,
+        options
+      );
+    }
+
     const postMode: TikTokPostMode = metadata.postMode ?? "INBOX";
-    // TikTok publishes one video per post. Throws on a carousel rather than
+    // A TikTok video post publishes one file. Throws on a carousel rather than
     // silently sending its first item.
     const media = requireSingleMedia(post);
 
@@ -308,10 +518,14 @@ export const tiktokAdapter: PublishAdapter = {
         return "published";
       case "FAILED":
         return "failed";
-      // The video reached the creator's inbox — as far as this integration
+      // The media reached the creator's inbox — as far as this integration
       // goes, that IS the delivered state. The creator finishes in the app.
       case "SEND_TO_USER_INBOX":
         return "published";
+      // Photo carousels only: TikTok is still fetching the images from us. The
+      // signed URLs must outlive this, which is why they get four hours.
+      case "PROCESSING_DOWNLOAD":
+        return "pending";
       default:
         return "pending";
     }

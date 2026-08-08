@@ -9,16 +9,21 @@ import { toUserTagsParam } from "../lib/scheduler/adapters/instagram";
 import { toTagList } from "../lib/scheduler/adapters/youtube";
 import {
   derivePostType,
+  maxItemsFor,
   selectionBlocker,
 } from "../components/scheduler/platform-meta";
+import { PLATFORM_CONSTRAINTS } from "../lib/scheduler/constraints";
 import {
   CAROUSEL_MAX_ITEMS,
   CAROUSEL_MIN_ITEMS,
+  MAX_MEDIA_ITEMS,
   MEDIA_SHAPE_BY_POST_TYPE,
   MEDIA_TYPE_BY_PLATFORM,
   PublishError,
   requireSingleMedia,
   SCHEDULED_POST_TYPES,
+  TIKTOK_PHOTO_MAX_ITEMS,
+  TIKTOK_PHOTO_MIN_ITEMS,
 } from "../lib/scheduler/types";
 
 /**
@@ -75,7 +80,13 @@ describe("media types per platform", () => {
       "CAROUSEL",
     ]);
     expect(MEDIA_TYPE_BY_PLATFORM.YOUTUBE).toEqual(["SHORT"]);
-    expect(MEDIA_TYPE_BY_PLATFORM.TIKTOK).toEqual(["TIKTOK_VIDEO"]);
+    // Two, and they are two different ENDPOINTS, not two flavours of one:
+    // TIKTOK_VIDEO goes to /post/publish/video/init/ and TIKTOK_PHOTO to
+    // /post/publish/content/init/.
+    expect(MEDIA_TYPE_BY_PLATFORM.TIKTOK).toEqual([
+      "TIKTOK_VIDEO",
+      "TIKTOK_PHOTO",
+    ]);
     expect(MEDIA_TYPE_BY_PLATFORM.FACEBOOK_PAGE).toEqual([
       "FACEBOOK_REEL",
       "FACEBOOK_VIDEO",
@@ -203,11 +214,21 @@ describe("requireSingleMedia", () => {
 });
 
 describe("media shape per post type", () => {
-  it("lets only a carousel hold more than one file", () => {
+  /**
+   * Two multi-item types now, with DIFFERENT bounds — Instagram's carousel at
+   * 10 and TikTok's photo post at 35. Asserting them together is the point:
+   * the pair used to be "CAROUSEL and everything else", and a single shared
+   * ceiling is exactly the assumption this guards against returning.
+   */
+  it("gives each multi-item post type its own bounds, and every other type exactly one file", () => {
     for (const [type, shape] of Object.entries(MEDIA_SHAPE_BY_POST_TYPE)) {
       if (type === "CAROUSEL") {
         expect(shape.maxItems).toBe(CAROUSEL_MAX_ITEMS);
         expect(shape.minItems).toBe(CAROUSEL_MIN_ITEMS);
+        expect(shape.maxItems).toBeGreaterThan(shape.minItems);
+      } else if (type === "TIKTOK_PHOTO") {
+        expect(shape.maxItems).toBe(TIKTOK_PHOTO_MAX_ITEMS);
+        expect(shape.minItems).toBe(TIKTOK_PHOTO_MIN_ITEMS);
         expect(shape.maxItems).toBeGreaterThan(shape.minItems);
       } else {
         expect(shape.minItems).toBe(1);
@@ -216,16 +237,48 @@ describe("media shape per post type", () => {
     }
   });
 
-  it("only lets Instagram post types accept a still image", () => {
+  it("bounds the API's media array by the most any one platform takes", () => {
+    expect(MAX_MEDIA_ITEMS).toBe(
+      Math.max(CAROUSEL_MAX_ITEMS, TIKTOK_PHOTO_MAX_ITEMS)
+    );
+    // The whole reason this constant exists: the two disagree, so neither one
+    // may be used as "the" limit.
+    expect(CAROUSEL_MAX_ITEMS).not.toBe(TIKTOK_PHOTO_MAX_ITEMS);
+  });
+
+  it("keeps every still-capable post type on a platform that accepts stills", () => {
     const stillCapable = Object.entries(MEDIA_SHAPE_BY_POST_TYPE)
       .filter(([, shape]) => shape.kinds.includes("IMAGE"))
       .map(([type]) => type);
 
-    expect(stillCapable.sort()).toEqual(["CAROUSEL", "IMAGE"]);
-    // ...and both of those belong to Instagram alone.
+    expect(stillCapable.sort()).toEqual([
+      "CAROUSEL",
+      "IMAGE",
+      "TIKTOK_PHOTO",
+    ]);
+
+    // Each one must be claimed by a platform whose constraints actually accept
+    // an image — a still-capable type on a video-only platform would validate
+    // at the API and fail in the worker.
     for (const type of stillCapable) {
-      expect(MEDIA_TYPE_BY_PLATFORM.INSTAGRAM).toContain(type);
+      const owners = Object.entries(MEDIA_TYPE_BY_PLATFORM)
+        .filter(([, types]) => (types as readonly string[]).includes(type))
+        .map(([platform]) => platform as keyof typeof MEDIA_TYPE_BY_PLATFORM);
+
+      expect(owners.length).toBeGreaterThan(0);
+      for (const platform of owners) {
+        expect(
+          PLATFORM_CONSTRAINTS[platform].imageMimeTypes.length
+        ).toBeGreaterThan(0);
+      }
     }
+  });
+
+  it("does not let a TikTok photo post carry a video", () => {
+    // TikTok's photo endpoint takes `photo_images` and nothing else; a video
+    // going to TikTok is a different post type AND a different endpoint.
+    expect(MEDIA_SHAPE_BY_POST_TYPE.TIKTOK_PHOTO.kinds).toEqual(["IMAGE"]);
+    expect(MEDIA_SHAPE_BY_POST_TYPE.TIKTOK_VIDEO.kinds).toEqual(["VIDEO"]);
   });
 
   it("covers every post type the platform map can produce", () => {
@@ -313,7 +366,9 @@ describe("composer selection gating", () => {
   });
 
   it("blocks multi-item selections on every single-video platform", () => {
-    for (const platform of ["TIKTOK", "YOUTUBE", "FACEBOOK_PAGE"] as const) {
+    // TikTok is deliberately absent: it takes a photo carousel now, so the
+    // multi-item rule is about VIDEOS there and is asserted separately below.
+    for (const platform of ["YOUTUBE", "FACEBOOK_PAGE"] as const) {
       expect(selectionBlocker(platform, ["VIDEO", "VIDEO"])).toMatch(
         /single video/
       );
@@ -321,9 +376,52 @@ describe("composer selection gating", () => {
   });
 
   it("blocks a photo on every platform that publishes video only", () => {
-    for (const platform of ["TIKTOK", "YOUTUBE", "FACEBOOK_PAGE"] as const) {
+    for (const platform of ["YOUTUBE", "FACEBOOK_PAGE"] as const) {
       expect(selectionBlocker(platform, ["IMAGE"])).toMatch(/not accept photos/);
     }
+  });
+
+  it("lets TikTok take a photo carousel", () => {
+    expect(selectionBlocker("TIKTOK", ["IMAGE", "IMAGE"])).toBeNull();
+    expect(
+      selectionBlocker("TIKTOK", Array(TIKTOK_PHOTO_MAX_ITEMS).fill("IMAGE"))
+    ).toBeNull();
+    expect(selectionBlocker("TIKTOK", ["VIDEO"])).toBeNull();
+  });
+
+  it("blocks the TikTok selections its two endpoints cannot express", () => {
+    // Photos and video are separate endpoints with separate bodies — there is
+    // no documented way to put a video inside a photo carousel.
+    expect(selectionBlocker("TIKTOK", ["IMAGE", "VIDEO"])).toMatch(
+      /not both/
+    );
+    expect(selectionBlocker("TIKTOK", ["VIDEO", "VIDEO"])).toMatch(
+      /one video per post/
+    );
+    // Ours, not TikTok's: the docs state no floor for a photo post.
+    expect(selectionBlocker("TIKTOK", ["IMAGE"])).toMatch(
+      new RegExp(`at least ${TIKTOK_PHOTO_MIN_ITEMS} photos`)
+    );
+    expect(
+      selectionBlocker(
+        "TIKTOK",
+        Array(TIKTOK_PHOTO_MAX_ITEMS + 1).fill("IMAGE")
+      )
+    ).toMatch(new RegExp(`at most ${TIKTOK_PHOTO_MAX_ITEMS} photos`));
+  });
+
+  it("caps each platform at what its derived post type can hold", () => {
+    // The composer takes the SMALLEST of these across the ticked platforms, so
+    // a wrong number here silently over- or under-fills the tray.
+    expect(maxItemsFor("INSTAGRAM", ["IMAGE", "IMAGE"])).toBe(
+      CAROUSEL_MAX_ITEMS
+    );
+    expect(maxItemsFor("TIKTOK", ["IMAGE", "IMAGE"])).toBe(
+      TIKTOK_PHOTO_MAX_ITEMS
+    );
+    // A video selection is a TIKTOK_VIDEO post, which takes exactly one.
+    expect(maxItemsFor("TIKTOK", ["VIDEO"])).toBe(1);
+    expect(maxItemsFor("YOUTUBE", ["VIDEO"])).toBe(1);
   });
 
   it("blocks nothing before any file is chosen", () => {

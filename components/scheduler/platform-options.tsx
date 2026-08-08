@@ -26,6 +26,8 @@ interface PlatformOptionsProps {
   mediaType: string;
   value: TargetOptions;
   onChange: (patch: Partial<TargetOptions>) => void;
+  /** How many files the post carries — drives TikTok's cover picker. */
+  photoCount?: number;
   /** TikTok only — INBOX needs no options at all. */
   tiktokPostMode?: "INBOX" | "DIRECT_POST" | null;
 }
@@ -298,17 +300,34 @@ const TIKTOK_PRIVACY_LEVELS = [
 ] as const;
 
 function TikTokOptions({
+  mediaType,
   value,
   onChange,
+  photoCount,
   tiktokPostMode,
-}: Pick<PlatformOptionsProps, "value" | "onChange" | "tiktokPostMode">) {
+}: Pick<
+  PlatformOptionsProps,
+  "mediaType" | "value" | "onChange" | "photoCount" | "tiktokPostMode"
+>) {
+  const isPhoto = mediaType === "TIKTOK_PHOTO";
+
   if (tiktokPostMode !== "DIRECT_POST") {
     return (
-      <p className="rounded-md border border-border bg-background px-3 py-2 text-sm text-muted">
-        This video is delivered to your TikTok inbox at the scheduled time. You
-        set the caption, privacy and everything else in the TikTok app when you
-        finish posting — so there is nothing to configure here.
-      </p>
+      <div className="space-y-3">
+        <p className="rounded-md border border-border bg-background px-3 py-2 text-sm text-muted">
+          {isPhoto
+            ? "These photos are delivered to your TikTok inbox at the scheduled time. You set the caption, the sound, privacy and everything else in the TikTok app when you finish posting — so there is nothing to configure here."
+            : "This video is delivered to your TikTok inbox at the scheduled time. You set the caption, privacy and everything else in the TikTok app when you finish posting — so there is nothing to configure here."}
+        </p>
+        {isPhoto && (
+          // Worth saying plainly: this is the ONLY way to choose a specific
+          // sound. TikTok's API has no track selector at all.
+          <p className="text-xs text-muted">
+            Finishing in the app is also the only way to pick a specific sound —
+            TikTok&apos;s API cannot choose a track.
+          </p>
+        )}
+      </div>
     );
   }
 
@@ -316,8 +335,42 @@ function TikTokOptions({
 
   return (
     <div className="space-y-4">
+      {isPhoto && (
+        <>
+          <Field
+            label="Title"
+            hint="Optional, up to 90 characters. Your caption becomes the description, where hashtags go."
+          >
+            <TextInput
+              value={value.title}
+              onChange={(v) => onChange({ title: v || undefined })}
+              placeholder="A short headline"
+            />
+          </Field>
+
+          <Field
+            label="Cover photo"
+            hint="Which photo TikTok shows on your profile grid."
+          >
+            <select
+              value={String(value.photoCoverIndex ?? 0)}
+              onChange={(e) =>
+                onChange({ photoCoverIndex: Number(e.target.value) })
+              }
+              className={inputClass}
+            >
+              {Array.from({ length: Math.max(photoCount ?? 1, 1) }, (_, i) => (
+                <option key={i} value={i}>
+                  Photo {i + 1}
+                </option>
+              ))}
+            </select>
+          </Field>
+        </>
+      )}
+
       <Field
-        label="Who can see this video"
+        label={isPhoto ? "Who can see this post" : "Who can see this video"}
         hint="TikTok requires you to choose — there is no default."
       >
         <select
@@ -345,18 +398,44 @@ function TikTokOptions({
         </select>
       </Field>
 
-      <Field label="Cover frame (ms)" hint="Milliseconds into the video.">
-        <TextInput
-          type="number"
-          value={value.videoCoverTimestampMs}
-          onChange={(v) =>
-            onChange({
-              videoCoverTimestampMs: v === "" ? undefined : Number(v),
-            })
-          }
-          placeholder="1000"
-        />
-      </Field>
+      {/* Video-only. TikTok's photo endpoint documents no cover timestamp, no
+          Duet and no Stitch, and the adapter omits those fields entirely — so
+          offering them here would collect a setting nothing sends. */}
+      {!isPhoto && (
+        <Field label="Cover frame (ms)" hint="Milliseconds into the video.">
+          <TextInput
+            type="number"
+            value={value.videoCoverTimestampMs}
+            onChange={(v) =>
+              onChange({
+                videoCoverTimestampMs: v === "" ? undefined : Number(v),
+              })
+            }
+            placeholder="1000"
+          />
+        </Field>
+      )}
+
+      {isPhoto && (
+        <fieldset className="space-y-2.5">
+          <legend className="mb-1 text-sm font-medium text-foreground">
+            Sound
+          </legend>
+          <Toggle
+            label="Let TikTok add music"
+            hint="TikTok picks a recommended track. You can change it in the app afterwards."
+            checked={value.autoAddMusic ?? false}
+            onChange={(checked) => onChange({ autoAddMusic: checked })}
+          />
+          {/* The honest limitation, stated where someone would look for a track
+              picker: there is no API for one, on any post type. */}
+          <p className="text-xs text-muted">
+            TikTok&apos;s API cannot choose a specific sound. To pick your own,
+            switch this account to inbox delivery and finish the post in the
+            TikTok app.
+          </p>
+        </fieldset>
+      )}
 
       <fieldset className="space-y-2.5">
         <legend className="mb-1 text-sm font-medium text-foreground">
@@ -367,16 +446,20 @@ function TikTokOptions({
           checked={value.disableComment ?? false}
           onChange={(checked) => onChange({ disableComment: checked })}
         />
-        <Toggle
-          label="Disable Duet"
-          checked={value.disableDuet ?? false}
-          onChange={(checked) => onChange({ disableDuet: checked })}
-        />
-        <Toggle
-          label="Disable Stitch"
-          checked={value.disableStitch ?? false}
-          onChange={(checked) => onChange({ disableStitch: checked })}
-        />
+        {!isPhoto && (
+          <>
+            <Toggle
+              label="Disable Duet"
+              checked={value.disableDuet ?? false}
+              onChange={(checked) => onChange({ disableDuet: checked })}
+            />
+            <Toggle
+              label="Disable Stitch"
+              checked={value.disableStitch ?? false}
+              onChange={(checked) => onChange({ disableStitch: checked })}
+            />
+          </>
+        )}
       </fieldset>
 
       <fieldset className="space-y-2.5">
@@ -414,8 +497,8 @@ function TikTokOptions({
       <p className="rounded-md border border-border bg-background px-3 py-2 text-xs text-muted">
         By scheduling this you agree to TikTok&apos;s{" "}
         {brandedContent ? "Branded Content Policy and " : ""}Music Usage
-        Confirmation. TikTok may take a few minutes to process the video after
-        posting.
+        Confirmation. TikTok may take a few minutes to process the{" "}
+        {isPhoto ? "photos" : "video"} after posting.
       </p>
     </div>
   );
@@ -451,6 +534,7 @@ export default function PlatformOptions({
   mediaType,
   value,
   onChange,
+  photoCount,
   tiktokPostMode,
 }: PlatformOptionsProps) {
   switch (platform) {
@@ -467,8 +551,10 @@ export default function PlatformOptions({
     case "TIKTOK":
       return (
         <TikTokOptions
+          mediaType={mediaType}
           value={value}
           onChange={onChange}
+          photoCount={photoCount}
           tiktokPostMode={tiktokPostMode}
         />
       );
