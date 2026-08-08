@@ -30,6 +30,26 @@ export function getMetaGraphApiVersion(): string {
   return process.env.META_GRAPH_API_VERSION ?? "v25.0";
 }
 
+/**
+ * One Instagram authorization for both comment→DM and scheduler publishing.
+ *
+ * On by default: both flows are the same OAuth against the same app, so a
+ * self-hosted instance connecting its own accounts has no reason to consent
+ * twice.
+ *
+ * Turn it OFF (`IG_UNIFIED_CONNECT=0`) for a multi-tenant instance where
+ * strangers connect. `instagram_business_content_publish` is a separate App
+ * Review track, and a consent screen containing a permission that lacks
+ * Advanced Access fails *entirely* for non-tester users — which would take the
+ * already-approved messaging connection down with it. Split flows keep that
+ * blast radius to the publishing feature alone.
+ */
+export function isUnifiedInstagramConnectEnabled(): boolean {
+  const raw = process.env.IG_UNIFIED_CONNECT?.trim().toLowerCase();
+  if (raw === undefined || raw === "") return true;
+  return !["0", "false", "no", "off"].includes(raw);
+}
+
 // ─── Scheduler ──────────────────────────────────────────────────────────────
 
 /**

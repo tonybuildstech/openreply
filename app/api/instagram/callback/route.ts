@@ -7,6 +7,8 @@ import { getLongLivedToken, getUserInfo, subscribeInstagramAccountToWebhooks } f
 import {
   encryptToken,
   exchangeCodeForToken,
+  getInstagramConnectScopes,
+  grantedPublishing,
   verifyOAuthState,
 } from "@/lib/meta/oauth";
 import { canManageWorkspace } from "@/lib/workspace-access";
@@ -18,7 +20,15 @@ export async function GET(request: NextRequest) {
   const baseUrl = getBaseUrl();
 
   if (error) {
-    return NextResponse.redirect(`${baseUrl}/settings?instagram=denied`);
+    // If this attempt included the publishing scope, tell Settings so it can
+    // offer the messaging-only retry. An unapproved publishing permission is
+    // the most likely reason a unified consent screen comes back refused, and
+    // comment→DM works fine without it.
+    return NextResponse.redirect(
+      state?.pub
+        ? `${baseUrl}/settings?instagram=denied&retry=messaging`
+        : `${baseUrl}/settings?instagram=denied`
+    );
   }
 
   if (!code || !state) {
@@ -43,10 +53,9 @@ export async function GET(request: NextRequest) {
 
   try {
     const redirectUri = `${baseUrl}/api/instagram/callback`;
-    const { accessToken: shortLivedToken } = await exchangeCodeForToken(
-      code,
-      redirectUri
-    );
+    const { accessToken: shortLivedToken, permissions } =
+      await exchangeCodeForToken(code, redirectUri);
+    const canPublish = grantedPublishing(Boolean(state.pub), permissions);
     const { accessToken: longLivedToken, expiresIn } =
       await getLongLivedToken(shortLivedToken);
     const userInfo = await getUserInfo(longLivedToken);
@@ -103,6 +112,68 @@ export async function GET(request: NextRequest) {
         webhookSubscribed,
       },
     });
+
+    if (canPublish) {
+      // The scheduler reads ConnectedAccount, not InstagramAccount — it is the
+      // platform-agnostic table shared with YouTube, TikTok and Facebook Pages,
+      // and Instagram must not become a special case inside it. So the same
+      // authorization writes a second row here rather than the two features
+      // sharing one.
+      //
+      // Deliberately non-fatal: comment→DM is the primary feature and is
+      // already committed above. A failure to light up publishing must not
+      // undo it.
+      try {
+        const publishingData = {
+          displayName: userInfo.username,
+          avatarUrl: userInfo.profile_picture_url ?? null,
+          // Same cipher and key as InstagramAccount.accessToken
+          // (lib/crypto/token-cipher.ts), so the value is interchangeable.
+          accessToken: encryptedToken,
+          tokenExpiresAt,
+          // ConnectedAccount.scopes documents what the platform actually
+          // granted, so prefer Instagram's own list and fall back to what we
+          // asked for only when it does not report one.
+          scopes: permissions ?? getInstagramConnectScopes(true),
+          metadata: {},
+          // Reconnecting is how a user clears NEEDS_REAUTH.
+          status: "ACTIVE" as const,
+        };
+
+        await prisma.connectedAccount.upsert({
+          where: {
+            workspaceId_platform_platformAccountId: {
+              workspaceId: state.workspaceId,
+              platform: "INSTAGRAM",
+              platformAccountId: instagramId,
+            },
+          },
+          create: {
+            workspaceId: state.workspaceId,
+            platform: "INSTAGRAM",
+            platformAccountId: instagramId,
+            ...publishingData,
+          },
+          update: publishingData,
+        });
+      } catch (publishingError) {
+        console.error(
+          "[Instagram Callback] Publishing connection failed:",
+          publishingError
+        );
+        await prisma.operationalEvent
+          .create({
+            data: {
+              workspaceId: state.workspaceId,
+              source: "SYSTEM",
+              level: "WARNING",
+              message: `Connected @${userInfo.username} for DMs, but linking it for scheduled publishing failed`,
+              payload: { instagramId, username: userInfo.username },
+            },
+          })
+          .catch(() => {});
+      }
+    }
 
     return NextResponse.redirect(`${baseUrl}/dashboard?connected=true`);
   } catch (err) {

@@ -13,6 +13,11 @@ const STATE_MAX_AGE_MS = 10 * 60 * 1000;
 interface OAuthStatePayload {
   workspaceId: string;
   ts: number;
+  // Whether this authorization asked for the publishing scope. Carried through
+  // the signed state so the callback knows what to expect without trusting a
+  // query param it did not sign. Absent on states minted before the unified
+  // flow existed (and on messaging-only connects), which read as `false`.
+  pub?: boolean;
 }
 
 function base64UrlEncode(value: string): string {
@@ -29,9 +34,16 @@ function signState(payload: string): string {
     .digest("base64url");
 }
 
-export function createOAuthState(workspaceId: string): string {
+export function createOAuthState(
+  workspaceId: string,
+  requestedPublishing = false
+): string {
   const payload = base64UrlEncode(
-    JSON.stringify({ workspaceId, ts: Date.now() } satisfies OAuthStatePayload)
+    JSON.stringify({
+      workspaceId,
+      ts: Date.now(),
+      ...(requestedPublishing ? { pub: true } : {}),
+    } satisfies OAuthStatePayload)
   );
   return `${payload}.${signState(payload)}`;
 }
@@ -65,12 +77,38 @@ export function verifyOAuthState(state: string | null): OAuthStatePayload | null
   }
 }
 
-export function getAuthorizationUrl(redirectUri: string, state: string): string {
+/** What comment→DM needs: read the account, read comments, send messages. */
+export const INSTAGRAM_MESSAGING_SCOPES = [
+  "instagram_business_basic",
+  "instagram_business_manage_messages",
+  "instagram_business_manage_comments",
+  "instagram_business_manage_insights",
+] as const;
+
+/**
+ * What the scheduler needs on top, to publish media. A SEPARATE App Review
+ * submission from the messaging scopes — see `isUnifiedInstagramConnectEnabled()`
+ * in lib/env.ts for why that matters to whoever is consenting.
+ */
+export const INSTAGRAM_PUBLISHING_SCOPE = "instagram_business_content_publish";
+
+export function getInstagramConnectScopes(includePublishing: boolean): string[] {
+  return includePublishing
+    ? [...INSTAGRAM_MESSAGING_SCOPES, INSTAGRAM_PUBLISHING_SCOPE]
+    : [...INSTAGRAM_MESSAGING_SCOPES];
+}
+
+export function getAuthorizationUrl(
+  redirectUri: string,
+  state: string,
+  // Defaults to messaging-only so every pre-existing caller behaves exactly as
+  // it did before the unified flow was added.
+  scopes: readonly string[] = INSTAGRAM_MESSAGING_SCOPES
+): string {
   const params = new URLSearchParams({
     client_id: requireEnv("INSTAGRAM_APP_ID"),
     redirect_uri: redirectUri,
-    scope:
-      "instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments,instagram_business_manage_insights",
+    scope: scopes.join(","),
     response_type: "code",
     state,
   });
@@ -78,10 +116,36 @@ export function getAuthorizationUrl(redirectUri: string, state: string): string 
   return `${INSTAGRAM_OAUTH_URL}?${params.toString()}`;
 }
 
+/**
+ * Whether a token may publish, given what we asked for and what Instagram said
+ * it granted.
+ *
+ * `reported` is whatever the token exchange returned, which may be nothing:
+ * it is not confirmed that Instagram-Login token responses carry a
+ * `permissions` field at all (open question in
+ * `.dev/changes/unified-instagram-connect/questions.md`). When it is absent we
+ * trust the request — which is exactly what the scheduler's own connect flow
+ * already does by hardcoding `scopes: INSTAGRAM_PUBLISH_SCOPES`. So this is
+ * never worse than the status quo, and strictly better the moment Instagram
+ * does report grants.
+ */
+export function grantedPublishing(
+  requestedPublishing: boolean,
+  reported?: string[] | null
+): boolean {
+  if (!requestedPublishing) return false;
+  if (!reported || reported.length === 0) return true;
+  return reported.includes(INSTAGRAM_PUBLISHING_SCOPE);
+}
+
 export async function exchangeCodeForToken(
   code: string,
   redirectUri: string
-): Promise<{ accessToken: string; userId: string }> {
+): Promise<{
+  accessToken: string;
+  userId: string;
+  permissions?: string[];
+}> {
   const body = new URLSearchParams({
     client_id: requireEnv("INSTAGRAM_APP_ID"),
     client_secret: requireEnv("INSTAGRAM_APP_SECRET"),
@@ -107,6 +171,18 @@ export async function exchangeCodeForToken(
   return {
     accessToken: data.access_token,
     userId: String(data.user_id),
+    // Passed through only if Instagram sends it; see `grantedPublishing()`.
+    // Tolerates both an array and a comma-separated string, since the shape is
+    // unconfirmed for Instagram Login tokens.
+    permissions: normalizePermissions(data.permissions),
   };
+}
+
+function normalizePermissions(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) return value.map(String);
+  if (typeof value === "string" && value.trim() !== "") {
+    return value.split(",").map((entry) => entry.trim());
+  }
+  return undefined;
 }
 

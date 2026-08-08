@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/db/client";
+import { isUnifiedInstagramConnectEnabled } from "@/lib/env";
 import type { TikTokAccountMetadata } from "@/lib/scheduler/adapters/tiktok";
 import { PLATFORM_CONSTRAINTS } from "@/lib/scheduler/constraints";
 import { getYouTubeQuotaState } from "@/lib/scheduler/quota";
@@ -76,6 +77,9 @@ export async function GET() {
       youtubeQuota,
       constraints: PLATFORM_CONSTRAINTS,
       canManage: canManageWorkspace(context.role),
+      // When on, Instagram is connected once from Settings and this page must
+      // point there rather than offering a second, separate authorization.
+      unifiedInstagramConnect: isUnifiedInstagramConnectEnabled(),
     },
   });
 }

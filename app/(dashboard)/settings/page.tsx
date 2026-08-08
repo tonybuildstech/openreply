@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import type { AccountOption } from "@/components/account-select";
 
 interface SettingsData {
@@ -21,6 +22,7 @@ interface SettingsData {
       webhookSubscribed: boolean;
     }
   >;
+  unifiedInstagramConnect: boolean;
 }
 
 interface WorkspaceMembersData {
@@ -54,6 +56,13 @@ export default function SettingsPage() {
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<"ADMIN" | "MEMBER">("MEMBER");
   const [memberError, setMemberError] = useState<string | null>(null);
+
+  // Set by /api/instagram/callback when a consent screen that included the
+  // publishing scope came back refused — the cue to offer the DM-only retry.
+  const searchParams = useSearchParams();
+  const connectDenied =
+    searchParams.get("instagram") === "denied" &&
+    searchParams.get("retry") === "messaging";
 
   useEffect(() => {
     Promise.all([
@@ -200,13 +209,35 @@ export default function SettingsPage() {
           </div>
         </div>
 
-        <div className="mt-6 pt-4 border-t border-border flex gap-3">
-          <a
-            href="/api/instagram/connect"
-            className="px-4 py-2 rounded text-sm font-medium transition-colors bg-accent text-white hover:bg-accent-hover"
-          >
-            {accounts.length > 0 ? "Connect another account" : "Connect Instagram"}
-          </a>
+        <div className="mt-6 pt-4 border-t border-border">
+          <div className="flex gap-3">
+            <a
+              href="/api/instagram/connect"
+              className="px-4 py-2 rounded text-sm font-medium transition-colors bg-accent text-white hover:bg-accent-hover"
+            >
+              {accounts.length > 0 ? "Connect another account" : "Connect Instagram"}
+            </a>
+          </div>
+
+          {data?.unifiedInstagramConnect && (
+            <p className="mt-3 text-xs text-muted">
+              One authorization covers both comment&rarr;DM and scheduled
+              publishing — no need to connect again under Scheduler.
+              {connectDenied && (
+                <>
+                  {" "}
+                  Consent screen refused?{" "}
+                  <a
+                    href="/api/instagram/connect?publish=0"
+                    className="underline hover:text-foreground"
+                  >
+                    Connect for DMs only
+                  </a>
+                  , which skips the publishing permission.
+                </>
+              )}
+            </p>
+          )}
         </div>
       </section>
 

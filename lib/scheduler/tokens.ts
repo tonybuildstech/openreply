@@ -11,8 +11,9 @@
  *    routine state to handle, not an exotic one.
  *  - **TikTok**   ~24 h access tokens, ~365 day refresh tokens. The docs do not
  *    say whether the refresh token rotates, so we persist whatever comes back.
- *  - **Instagram** 60-day long-lived tokens, refreshed by the existing
- *    `/api/cron/refresh-tokens` job. Used as-is here.
+ *  - **Instagram** 60-day long-lived tokens, refreshed by the daily
+ *    `/api/cron/refresh-tokens` job — which sweeps `ConnectedAccount` rows as
+ *    well as `InstagramAccount` ones. Used as-is here.
  *  - **Facebook** Page tokens do not expire while the user token is valid.
  *
  * The naming convention from lib/crypto/token-cipher.ts applies: every
@@ -213,8 +214,10 @@ export async function resolveAccessToken(
 
     case "INSTAGRAM":
     case "FACEBOOK_PAGE":
-      // IG long-lived tokens are refreshed by /api/cron/refresh-tokens; FB Page
-      // tokens do not expire on their own.
+      // IG long-lived tokens are refreshed by /api/cron/refresh-tokens (which
+      // covers this table too); FB Page tokens do not expire on their own.
+      // Reaching the expired branch means the cron has not run, or its refresh
+      // failed — either way only a reconnect fixes it.
       if (isExpired(account)) {
         await markNeedsReauth(account.id);
         throw new PublishError(

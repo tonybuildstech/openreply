@@ -45,9 +45,37 @@ export async function GET(request: NextRequest) {
     },
   });
 
+  // The scheduler's Instagram rows live in ConnectedAccount and hold their own
+  // copy of the long-lived token. They were never refreshed here, so publishing
+  // silently died ~60 days after connecting while the DM connection kept
+  // working. Same 60-day token, same refresh endpoint — just a second table.
+  const connectedToRefresh = await prisma.connectedAccount.findMany({
+    where: {
+      platform: "INSTAGRAM",
+      status: { not: "DISABLED" },
+      tokenExpiresAt: {
+        not: null,
+        lte: cutoffDate,
+      },
+    },
+    select: {
+      id: true,
+      workspaceId: true,
+      displayName: true,
+      accessToken: true,
+    },
+  });
+
   const results: Array<{
     instagramAccountId: string;
     username: string;
+    status: "refreshed" | "failed";
+    error?: string;
+  }> = [];
+
+  const connectedResults: Array<{
+    connectedAccountId: string;
+    displayName: string;
     status: "refreshed" | "failed";
     error?: string;
   }> = [];
@@ -97,12 +125,69 @@ export async function GET(request: NextRequest) {
     }
   }
 
+  for (const account of connectedToRefresh) {
+    try {
+      const currentToken = decryptToken(account.accessToken);
+      const { accessToken: newToken, expiresIn } =
+        await refreshLongLivedToken(currentToken);
+
+      await prisma.connectedAccount.update({
+        where: { id: account.id },
+        data: {
+          accessToken: encryptToken(newToken),
+          tokenExpiresAt: new Date(Date.now() + expiresIn * 1000),
+          // A previously expired connection is healthy again once it refreshes.
+          status: "ACTIVE",
+        },
+      });
+
+      connectedResults.push({
+        connectedAccountId: account.id,
+        displayName: account.displayName,
+        status: "refreshed",
+      });
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : "Unknown error";
+
+      // A refresh that fails is unrecoverable without the user — Instagram
+      // will not re-issue from a dead token. Flag it so the Connections page
+      // shows "reconnect" instead of failing at publish time.
+      await prisma.connectedAccount.update({
+        where: { id: account.id },
+        data: { status: "NEEDS_REAUTH" },
+      });
+
+      await prisma.operationalEvent.create({
+        data: {
+          workspaceId: account.workspaceId,
+          source: "TOKEN_REFRESH",
+          level: "ERROR",
+          message: `Publishing token refresh failed for ${account.displayName}: ${errorMessage}`,
+          payload: {
+            connectedAccountId: account.id,
+            platform: "INSTAGRAM",
+            displayName: account.displayName,
+          },
+        },
+      });
+
+      connectedResults.push({
+        connectedAccountId: account.id,
+        displayName: account.displayName,
+        status: "failed",
+        error: errorMessage,
+      });
+    }
+  }
+
   return NextResponse.json({
     success: true,
     data: {
       totalProcessed: accountsToRefresh.length,
       workspacesReset: usageReset.count,
       results,
+      connectedProcessed: connectedToRefresh.length,
+      connectedResults,
     },
   });
 }

@@ -55,6 +55,7 @@ export default function ConnectionsPage() {
   const [accounts, setAccounts] = useState<ConnectedAccount[]>([]);
   const [youtubeQuota, setYoutubeQuota] = useState<YouTubeQuota | null>(null);
   const [canManage, setCanManage] = useState(false);
+  const [unifiedInstagram, setUnifiedInstagram] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -65,6 +66,7 @@ export default function ConnectionsPage() {
       setAccounts(payload.data.accounts);
       setYoutubeQuota(payload.data.youtubeQuota);
       setCanManage(payload.data.canManage);
+      setUnifiedInstagram(Boolean(payload.data.unifiedInstagramConnect));
     }
     setLoading(false);
   }, []);
@@ -132,6 +134,14 @@ export default function ConnectionsPage() {
             (a) => a.platform === platform
           );
 
+          // One Instagram authorization covers messaging and publishing, so
+          // send people to the single connect rather than asking the same
+          // account to consent a second time.
+          const unifiedHere = unifiedInstagram && platform === "INSTAGRAM";
+          const connectHref = unifiedHere
+            ? "/api/instagram/connect"
+            : `/api/connections/${meta.slug}/connect`;
+
           return (
             <section
               key={platform}
@@ -181,6 +191,13 @@ export default function ConnectionsPage() {
                       installation.
                     </p>
                   </div>
+                )}
+
+                {unifiedHere && (
+                  <p className="mb-3 rounded-lg border border-border bg-background px-3 py-2.5 text-xs leading-5 text-muted">
+                    Instagram is connected once, in Settings — the same
+                    authorization covers comment→DM and publishing here.
+                  </p>
                 )}
 
                 {platformAccounts.length === 0 ? (
@@ -242,7 +259,7 @@ export default function ConnectionsPage() {
               {canManage && (
                 <footer className="border-t border-border px-5 py-3">
                   <a
-                    href={`/api/connections/${meta.slug}/connect`}
+                    href={connectHref}
                     className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-border px-3 py-2 text-sm font-medium transition hover:bg-background"
                   >
                     <PlatformLogo platform={platform} className="h-4 w-4" />

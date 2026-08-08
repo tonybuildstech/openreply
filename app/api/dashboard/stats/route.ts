@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCurrentUserId, getCurrentWorkspaceId } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
+import { isUnifiedInstagramConnectEnabled } from "@/lib/env";
 import {
   calculateCtr,
   normalizeTopKeywords,
@@ -198,6 +199,9 @@ export async function GET(request: NextRequest) {
       instagramAccount,
       instagramAccounts,
       selectedInstagramAccountId: selectedAccountId,
+      // Drives the Settings copy: with one authorization covering both
+      // features, the page must not tell people to connect twice.
+      unifiedInstagramConnect: isUnifiedInstagramConnectEnabled(),
       totalAutomations,
       activeAutomations,
       dmsSentToday,

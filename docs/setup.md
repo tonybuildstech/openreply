@@ -99,6 +99,7 @@ Copy `.env.example` to `.env` for local work, or set these in Vercel and Railway
 | `INSTAGRAM_APP_SECRET` | From the Meta app. |
 | `FACEBOOK_APP_SECRET` | From the Meta app. |
 | `WEBHOOK_VERIFY_TOKEN` | Any random string. You paste the same value into Meta's webhook config. |
+| `IG_UNIFIED_CONNECT` | Optional, on by default. One Instagram authorization for comment-to-DM *and* scheduled publishing. Set to `0` to keep them separate — see [Instagram](#instagram) under the scheduler. |
 
 `ENCRYPTION_KEY` must be exactly 64 hex characters or the app throws on boot.
 
@@ -158,13 +159,16 @@ Until you accept here, the account is not really a tester and the login will kee
 
 ### Step 7: Register the OAuth redirect
 
-In the Instagram product, open Set up Instagram business login, then Business login settings. In the OAuth redirect URIs field, add exactly, using your Vercel domain:
+In the Instagram product, open Set up Instagram business login, then Business login settings. In the OAuth redirect URIs field, add both of these, using your Vercel domain:
 
 ```
 https://your-app.vercel.app/api/instagram/callback
+https://your-app.vercel.app/api/connections/instagram/callback
 ```
 
-No trailing slash. If this is missing or wrong, connecting an account fails with a redirect_uri mismatch. You can register more than one, which is useful if you change domains later; keep the old and new both listed.
+The first is the one everything normally uses. The second is only reached if you set `IG_UNIFIED_CONNECT=0` (see [the scheduler's Instagram section](#instagram)); register it now so you are not debugging a redirect_uri mismatch later.
+
+No trailing slash. If the first is missing or wrong, connecting an account fails with a redirect_uri mismatch. You can register more than one, which is useful if you change domains later; keep the old and new both listed.
 
 You do not need the "Embed URL" that Meta shows here. OpenReply builds its own login URL. Users connect by opening your app, going to Settings, and clicking Connect Instagram.
 
@@ -247,9 +251,25 @@ referencing it were already scheduled. Keep media somewhere `rsync` never touche
 
 Publishing needs the `instagram_business_content_publish` permission, which is a
 **separate App Review submission** from the messaging permissions used by comment-to-DM.
-Neither approval depends on the other. Add the permission in your existing Meta app,
-then connect the account again under Scheduler, Connections — the DM connection does not
-grant publishing.
+Neither approval depends on the other. Add the permission in your existing Meta app.
+
+You connect Instagram **once**, in Settings. That single authorization requests the
+messaging scopes and the publishing scope together, and the account then appears under
+Scheduler, Connections without consenting again.
+
+If the publishing permission is not approved on your app yet, a consent screen containing
+it can fail outright — and for non-tester users that would take comment-to-DM down with
+it. Two ways out, in increasing order of bluntness:
+
+- Connect for DMs only, once: `/api/instagram/connect?publish=0`. Settings offers this as
+  a link if a connection comes back refused.
+- Set `IG_UNIFIED_CONNECT=0` to make messaging-only the default for everyone. Publishing
+  then gets its own connect button under Scheduler, Connections, exactly as before. This
+  is the right setting for a **multi-tenant instance** where strangers sign up and the
+  publishing permission is still pending review.
+
+Both processes should agree on this variable, and remember PM2 does not re-read `.env` on
+its own — a full deploy or an explicit restart is needed for a change to take.
 
 Limit: 25 posts per rolling 24 hours, which OpenReply checks with Instagram before each
 publish.
