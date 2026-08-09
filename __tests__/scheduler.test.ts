@@ -214,6 +214,54 @@ describe("TikTok chunk planning", () => {
     expect(plan.chunkSize).toBeLessThanOrEqual(64 * 1024 * 1024);
   });
 
+  // The 5–10 MB window: floor(size / 5 MB) is 1, so this uploads as one chunk
+  // — and a lone chunk carries the whole file, whatever chunk_size claims.
+  // Declaring 5 MB for an 8.55 MB video is what TikTok answered with "The
+  // chunk size is invalid".
+  it("sends a single chunk as the whole file, not the 5 MB minimum", () => {
+    const plan = planChunks(8_966_079);
+
+    expect(plan.totalChunkCount).toBe(1);
+    expect(plan.chunkSize).toBe(8_966_079);
+  });
+
+  it("keeps chunk_size consistent with total_chunk_count at every size", () => {
+    const sizes = [
+      1,
+      1024,
+      5 * 1024 * 1024 - 1,
+      5 * 1024 * 1024,
+      5 * 1024 * 1024 + 1,
+      8_966_079,
+      10 * 1024 * 1024 - 1,
+      10 * 1024 * 1024,
+      37 * 1024 * 1024,
+      500 * 1024 * 1024,
+      4 * 1024 * 1024 * 1024,
+    ];
+
+    for (const size of sizes) {
+      const plan = planChunks(size);
+
+      // TikTok's own arithmetic. Anything else is a 400 at init or a 416
+      // partway through the upload.
+      expect(plan.totalChunkCount).toBe(
+        Math.floor(size / plan.chunkSize)
+      );
+      // A single chunk IS the file.
+      if (plan.totalChunkCount === 1) expect(plan.chunkSize).toBe(size);
+      // The 5 MB floor applies once the file is big enough to be split.
+      if (size >= 10 * 1024 * 1024) {
+        expect(plan.chunkSize).toBeGreaterThanOrEqual(5 * 1024 * 1024);
+      }
+      expect(plan.chunkSize).toBeLessThanOrEqual(64 * 1024 * 1024);
+      expect(plan.totalChunkCount).toBeLessThanOrEqual(1000);
+      // The final chunk absorbs the remainder and may not exceed 128 MB.
+      const finalChunk = size - (plan.totalChunkCount - 1) * plan.chunkSize;
+      expect(finalChunk).toBeLessThanOrEqual(128 * 1024 * 1024);
+    }
+  });
+
   it("never plans a zero-length chunk", () => {
     for (const size of [1, 5 * 1024 * 1024 + 1, 100 * 1024 * 1024]) {
       const plan = planChunks(size);

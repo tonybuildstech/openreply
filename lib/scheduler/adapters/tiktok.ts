@@ -150,8 +150,17 @@ export function planChunks(sizeBytes: number): {
   chunkSize: number;
   totalChunkCount: number;
 } {
-  // Anything under the 5 MB minimum must go up whole, in a single request.
-  if (sizeBytes <= MIN_CHUNK_BYTES) {
+  // A one-chunk upload sends the whole file in a single request, so chunk_size
+  // IS the file size. TikTok rejects a chunk_size describing less than what it
+  // is about to receive — "The chunk size is invalid" on init.
+  //
+  // The bound is 10 MB, not the 5 MB minimum, because floor(size / 5 MB) is
+  // still 1 all the way up to 10 MB: an 8.55 MB video declared 5 MB chunks and
+  // one chunk, which is a contradiction. Below 5 MB this is also TikTok's own
+  // documented exception (chunk_size = video_size), so one branch serves both.
+  // The resulting chunk_size stays inside the 5–64 MB band wherever the
+  // documented minimum applies.
+  if (sizeBytes < 2 * MIN_CHUNK_BYTES) {
     return { chunkSize: sizeBytes, totalChunkCount: 1 };
   }
 
