@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
 import Link from "next/link";
+import BrandMark, { BRAND_NAME } from "@/components/brand-mark";
 
 /* Keep the name at the front of the title and identical to the OAuth consent
    screen name — see the note in app/layout.tsx. */
@@ -12,8 +13,9 @@ export const metadata: Metadata = {
 
 const GITHUB_URL = "https://github.com/diwenne/openreply";
 
-/** The exact string configured as the app name on every OAuth consent screen. */
-const APP_NAME = "OpenReply";
+/** The exact string configured as the app name on every OAuth consent screen.
+    Re-exported from the brand lockup so the name and the icon share one source. */
+const APP_NAME = BRAND_NAME;
 
 /* Machine-readable restatement of the app name and purpose. OAuth reviewers
    (and their tooling) read this to confirm the home page describes the same
@@ -291,8 +293,8 @@ export default async function Home() {
 
       <header className="sticky top-0 z-40 border-b border-border bg-background">
         <div className="mx-auto flex h-16 w-full max-w-6xl items-center justify-between px-5 sm:px-6 lg:px-8">
-          <Link href="/" className="flex items-center gap-3" aria-label={`${APP_NAME} home`}>
-            <span className="text-lg font-bold text-white">{APP_NAME}</span>
+          <Link href="/" className="flex items-center" aria-label={`${APP_NAME} home`}>
+            <BrandMark />
           </Link>
 
           <div className="flex items-center gap-4">

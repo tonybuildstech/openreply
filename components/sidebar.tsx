@@ -8,6 +8,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import BrandMark from "@/components/brand-mark";
 
 const navItems = [
   { label: "Dashboard", href: "/dashboard" },
@@ -52,8 +53,8 @@ export default function Sidebar({
         `}
       >
         <div className="px-6 py-5 border-b border-border">
-          <Link href="/dashboard" className="text-base font-semibold">
-            OpenReply
+          <Link href="/dashboard" className="flex items-center">
+            <BrandMark size={28} nameClassName="text-base font-semibold" />
           </Link>
         </div>
 

@@ -1,4 +1,5 @@
 import Link from "next/link";
+import BrandMark, { BRAND_NAME } from "@/components/brand-mark";
 
 interface LegalShellProps {
   title: string;
@@ -17,8 +18,8 @@ export default function LegalShell({
     <main className="min-h-screen bg-background text-foreground">
       <header className="border-b border-white/10">
         <div className="mx-auto flex h-16 max-w-5xl items-center justify-between px-5">
-          <Link href="/" className="flex items-center gap-3">
-            <span className="text-lg font-bold text-white">OpenReply</span>
+          <Link href="/" className="flex items-center" aria-label={`${BRAND_NAME} home`}>
+            <BrandMark />
           </Link>
           <Link
             href="/login"
