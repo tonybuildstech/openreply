@@ -31,7 +31,13 @@ function formatTime(iso: string | null): string {
   const now = new Date();
   const sameDay = d.toDateString() === now.toDateString();
   return sameDay
-    ? d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })
+    ? d.toLocaleTimeString(undefined, {
+        // 24h everywhere, regardless of the viewer's locale. "2-digit" rather
+        // than "numeric" so 09:05 lines up with 13:05 in the message list.
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      })
     : d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 

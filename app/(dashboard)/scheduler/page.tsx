@@ -252,6 +252,7 @@ export default function SchedulerPage() {
                             {new Date(post.scheduledAt).toLocaleTimeString([], {
                               hour: "2-digit",
                               minute: "2-digit",
+                              hour12: false,
                             })}
                           </span>
                           <span className="truncate text-sm text-muted">

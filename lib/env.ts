@@ -50,6 +50,31 @@ export function isUnifiedInstagramConnectEnabled(): boolean {
   return !["0", "false", "no", "off"].includes(raw);
 }
 
+/**
+ * True once TikTok has approved the `video.publish` scope for this app.
+ *
+ * This one flag means two things, because they are the same fact:
+ *
+ *  1. **Request the scope.** `video.publish` is added to the authorize call.
+ *     TikTok REJECTS an authorize request carrying a scope the app is not
+ *     approved for, so turning this on early breaks connecting entirely.
+ *  2. **The app passed the Content Posting audit.** Until it has, TikTok forces
+ *     every Direct Post to SELF_ONLY, which is why new accounts default to
+ *     inbox delivery — see `lib/scheduler/oauth/providers.ts`.
+ *
+ * Opt-in, and unset MUST read as "not approved" — the failure mode for guessing
+ * wrong in that direction is every TikTok connection attempt breaking. But the
+ * common truthy spellings are all accepted, because the opposite failure ("I set
+ * TIKTOK_ENABLE_DIRECT_POST=1 and nothing happened") is silent too, and on a
+ * self-hosted box there is no one to ask.
+ */
+const TRUTHY = ["true", "1", "yes", "on"];
+
+export function isTikTokDirectPostEnabled(): boolean {
+  const raw = process.env.TIKTOK_ENABLE_DIRECT_POST?.trim().toLowerCase();
+  return raw !== undefined && TRUTHY.includes(raw);
+}
+
 // ─── Scheduler ──────────────────────────────────────────────────────────────
 
 /**

@@ -40,6 +40,8 @@ interface ConnectedAccount {
   status: "ACTIVE" | "NEEDS_REAUTH" | "DISABLED";
   tokenExpiresAt: string | null;
   tiktokPostMode: "INBOX" | "DIRECT_POST" | null;
+  /** TikTok only: app approved for video.publish AND this token carries it. */
+  tiktokCanDirectPost: boolean;
   limitation: string | null;
   createdAt: string;
 }
@@ -165,6 +167,32 @@ export default function ConnectionsPage() {
     const timer = window.setTimeout(() => void load(), 0);
     return () => window.clearTimeout(timer);
   }, [load]);
+
+  /**
+   * Flip a TikTok account between inbox delivery and Direct Post.
+   *
+   * The server re-checks both preconditions (app approval, and whether this
+   * token actually carries `video.publish`), so a stale page cannot force an
+   * invalid mode — surface whatever it says rather than assuming success.
+   */
+  async function setPostMode(
+    account: ConnectedAccount,
+    postMode: "INBOX" | "DIRECT_POST"
+  ) {
+    setBusy(account.id);
+    const res = await fetch("/api/scheduler/accounts", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connectedAccountId: account.id, postMode }),
+    });
+    const payload = await res.json().catch(() => null);
+    setBusy(null);
+    if (!payload?.success) {
+      alert(payload?.error ?? "Could not change the post mode.");
+      return;
+    }
+    void load();
+  }
 
   async function disconnect(account: ConnectedAccount) {
     if (
@@ -526,6 +554,45 @@ export default function ConnectionsPage() {
                             {account.limitation}
                           </p>
                         )}
+
+                        {/* Only rendered once Direct Post is genuinely reachable.
+                            Showing a disabled toggle to everyone else would just
+                            advertise a mode most apps are never approved for. */}
+                        {account.platform === "TIKTOK" &&
+                          account.tiktokCanDirectPost &&
+                          canManage && (
+                            <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                              <span className="text-xs text-muted">
+                                Delivery
+                              </span>
+                              {(
+                                [
+                                  ["DIRECT_POST", "Post automatically"],
+                                  ["INBOX", "Send to inbox"],
+                                ] as const
+                              ).map(([mode, label]) => {
+                                const active =
+                                  (account.tiktokPostMode ?? "INBOX") === mode;
+                                return (
+                                  <button
+                                    key={mode}
+                                    type="button"
+                                    disabled={active || busy === account.id}
+                                    onClick={() =>
+                                      void setPostMode(account, mode)
+                                    }
+                                    className={`rounded-md border px-2 py-1 text-xs transition disabled:opacity-60 ${
+                                      active
+                                        ? "border-accent bg-accent/10 text-accent"
+                                        : "border-border text-muted hover:border-foreground/30 hover:text-foreground"
+                                    }`}
+                                  >
+                                    {label}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
                       </li>
                     ))}
                   </ul>

@@ -11,7 +11,12 @@
  */
 
 import type { SocialPlatform } from "@/app/generated/prisma/client";
-import { getBaseUrl, getMetaGraphApiVersion, requireEnv } from "@/lib/env";
+import {
+  getBaseUrl,
+  getMetaGraphApiVersion,
+  isTikTokDirectPostEnabled,
+  requireEnv,
+} from "@/lib/env";
 import { fetchWithTimeout, toResponseSnippet } from "@/lib/scheduler/http";
 import { SLUG_BY_PLATFORM } from "@/lib/scheduler/oauth/state";
 import type { TikTokAccountMetadata } from "@/lib/scheduler/adapters/tiktok";
@@ -373,7 +378,7 @@ const facebookProvider: OAuthProvider = {
  */
 function tiktokScopes(): string[] {
   const scopes = ["user.info.basic", "video.upload"];
-  if (process.env.TIKTOK_ENABLE_DIRECT_POST === "true") {
+  if (isTikTokDirectPostEnabled()) {
     scopes.push("video.publish");
   }
   return scopes;
@@ -425,12 +430,22 @@ const tiktokProvider: OAuthProvider = {
       data?: { user?: { display_name?: string; avatar_url?: string } };
     }>(profileResponse, "TikTok profile lookup");
 
+    // Both values follow the app's approval state, because the token being
+    // minted right now does too: `tiktokScopes()` only asked for
+    // `video.publish` under the same flag, so an account connected while the
+    // app is unapproved CANNOT direct post no matter what metadata claims.
+    //
+    // Unapproved → inbox is the honest default, since TikTok forces every
+    // Direct Post from an unaudited app to SELF_ONLY — a private video the
+    // creator never asked for. Approved → Direct Post is what the user turned
+    // the flag on to get, and the composer already collects TikTok's mandatory
+    // choices (privacy level, interaction toggles, commercial disclosure) for
+    // that path. Either way it stays switchable per account via
+    // PATCH /api/scheduler/accounts.
+    const directPostApproved = isTikTokDirectPostEnabled();
     const metadata: TikTokAccountMetadata = {
-      // Inbox is the honest default: TikTok forces every Direct Post from an
-      // unaudited app to SELF_ONLY, and their guidelines make that audit
-      // unlikely for a self-hosted tool. Switch per account once audited.
-      postMode: "INBOX",
-      auditApproved: false,
+      postMode: directPostApproved ? "DIRECT_POST" : "INBOX",
+      auditApproved: directPostApproved,
       creatorUsername: profile.data?.user?.display_name,
     };
 

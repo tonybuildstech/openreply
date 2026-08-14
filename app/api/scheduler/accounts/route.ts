@@ -1,7 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/db/client";
-import { isUnifiedInstagramConnectEnabled } from "@/lib/env";
+import {
+  isTikTokDirectPostEnabled,
+  isUnifiedInstagramConnectEnabled,
+} from "@/lib/env";
 import type { TikTokAccountMetadata } from "@/lib/scheduler/adapters/tiktok";
 import { PLATFORM_CONSTRAINTS } from "@/lib/scheduler/constraints";
 import { getYouTubeQuotaState } from "@/lib/scheduler/quota";
@@ -48,6 +51,7 @@ export async function GET() {
         status: true,
         tokenExpiresAt: true,
         metadata: true,
+        scopes: true,
         createdAt: true,
       },
     }),
@@ -79,7 +83,17 @@ export async function GET() {
         return {
           ...account,
           metadata: undefined,
+          scopes: undefined,
           tiktokPostMode: metadata.postMode ?? null,
+          /* Whether this account could switch to Direct Post right now. Needs
+             BOTH the app-level approval and a token minted after it — scopes
+             are fixed at authorize time, so an older account must reconnect.
+             Sent per account so the UI can explain which of the two is missing
+             instead of offering a switch that fails. */
+          tiktokCanDirectPost:
+            account.platform === "TIKTOK" &&
+            isTikTokDirectPostEnabled() &&
+            account.scopes.includes("video.publish"),
           // Both of these mean "posts will not be publicly visible".
           limitation:
             account.platform === "TIKTOK"
@@ -102,6 +116,123 @@ export async function GET() {
       unifiedInstagramConnect: isUnifiedInstagramConnectEnabled(),
     },
   });
+}
+
+const patchSchema = z.object({
+  connectedAccountId: z.string().min(1),
+  postMode: z.enum(["INBOX", "DIRECT_POST"]),
+});
+
+/**
+ * Switch a TikTok account between inbox delivery and Direct Post.
+ *
+ * Without this the mode was frozen at whatever it was set to when the account
+ * was connected, so an app that later passed TikTok's audit had no way to
+ * actually use Direct Post — posts kept landing in the creator's inbox as
+ * drafts with no explanation.
+ *
+ * Two guards, because Direct Post can fail for two unrelated reasons and the
+ * error TikTok returns for either is opaque:
+ *
+ *  - the APP may not be approved for `video.publish` at all; and
+ *  - this ACCOUNT's token may predate the approval. Scopes are baked into the
+ *    token at authorize time, so an account connected before the flag went on
+ *    holds `video.upload` only and has to be reconnected. `scopes` records what
+ *    TikTok actually granted, which is exactly the right thing to check.
+ *
+ * Catching both here turns a mid-publish failure — after the file has already
+ * been uploaded — into an immediate, actionable message.
+ */
+export async function PATCH(request: NextRequest) {
+  const context = await getCurrentWorkspaceContext();
+  if (!context) {
+    return NextResponse.json(
+      { success: false, error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+  if (!canManageWorkspace(context.role)) {
+    return NextResponse.json(
+      { success: false, error: "Forbidden" },
+      { status: 403 }
+    );
+  }
+
+  const parsed = patchSchema.safeParse(await request.json().catch(() => null));
+  if (!parsed.success) {
+    return NextResponse.json(
+      {
+        success: false,
+        error: "connectedAccountId and postMode (INBOX|DIRECT_POST) are required",
+      },
+      { status: 400 }
+    );
+  }
+
+  const { connectedAccountId, postMode } = parsed.data;
+
+  const account = await prisma.connectedAccount.findFirst({
+    where: { id: connectedAccountId, workspaceId: context.workspaceId },
+    select: { id: true, platform: true, scopes: true, metadata: true },
+  });
+
+  if (!account) {
+    return NextResponse.json(
+      { success: false, error: "Account not found" },
+      { status: 404 }
+    );
+  }
+  if (account.platform !== "TIKTOK") {
+    return NextResponse.json(
+      { success: false, error: "Post mode applies to TikTok accounts only" },
+      { status: 400 }
+    );
+  }
+
+  const directPostApproved = isTikTokDirectPostEnabled();
+
+  if (postMode === "DIRECT_POST") {
+    if (!directPostApproved) {
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            "Direct Post is off for this app. TikTok must approve the video.publish scope, then set TIKTOK_ENABLE_DIRECT_POST=true and restart both the web app and the worker.",
+        },
+        { status: 400 }
+      );
+    }
+    if (!account.scopes.includes("video.publish")) {
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            "This account was connected before Direct Post was enabled, so its token cannot publish. Disconnect it and connect it again, then switch.",
+        },
+        { status: 409 }
+      );
+    }
+  }
+
+  const existing = (account.metadata ?? {}) as TikTokAccountMetadata;
+
+  await prisma.connectedAccount.update({
+    where: { id: account.id },
+    data: {
+      // Spread first: `creatorUsername` and anything else stored alongside the
+      // post mode must survive the write.
+      metadata: {
+        ...existing,
+        postMode,
+        // Describes the APP's audit state, not the chosen mode, so it tracks
+        // the flag either way — it is what decides whether the UI warns that
+        // posts will go up privately.
+        auditApproved: directPostApproved,
+      },
+    },
+  });
+
+  return NextResponse.json({ success: true, data: { postMode } });
 }
 
 const deleteSchema = z.object({ connectedAccountId: z.string().min(1) });

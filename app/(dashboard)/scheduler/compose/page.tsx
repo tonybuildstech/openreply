@@ -1170,6 +1170,7 @@ export default function ComposePage() {
             {earliestAllowed.at.toLocaleTimeString([], {
               hour: "2-digit",
               minute: "2-digit",
+              hour12: false,
             })}
             , the earliest every selected account allows
           </button>

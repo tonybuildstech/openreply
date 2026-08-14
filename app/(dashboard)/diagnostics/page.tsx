@@ -53,7 +53,18 @@ interface DiagnosticsData {
 }
 
 function formatDate(value: string) {
-  return new Date(value).toLocaleString();
+  // Spelled out rather than left to `toLocaleString()`'s default, which picks
+  // 12h or 24h from the runtime locale — and for a server-rendered page that is
+  // the SERVER's locale, not the viewer's. Incident timestamps are read next to
+  // log lines, so they have to be unambiguous.
+  return new Date(value).toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
 }
 
 function EmptyState({ label }: { label: string }) {

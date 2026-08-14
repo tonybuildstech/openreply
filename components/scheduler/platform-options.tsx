@@ -315,9 +315,16 @@ function TikTokOptions({
     return (
       <div className="space-y-3">
         <p className="rounded-md border border-border bg-background px-3 py-2 text-sm text-muted">
+          {/* The two paths genuinely differ on the caption, so the copy has to.
+              The photo endpoint takes `post_info.description` even on the inbox
+              path, so the caption IS sent and arrives pre-filled. The inbox
+              VIDEO endpoint accepts `source_info` alone — there is no field to
+              put a caption in, so it is dropped and the creator retypes it.
+              See lib/scheduler/adapters/tiktok.ts. Saying "you set the caption"
+              for photos sent people off to retype one they already had. */}
           {isPhoto
-            ? "These photos are delivered to your TikTok inbox at the scheduled time. You set the caption, the sound, privacy and everything else in the TikTok app when you finish posting — so there is nothing to configure here."
-            : "This video is delivered to your TikTok inbox at the scheduled time. You set the caption, privacy and everything else in the TikTok app when you finish posting — so there is nothing to configure here."}
+            ? "These photos are delivered to your TikTok inbox at the scheduled time, with your caption already filled in as the description. You choose the sound, privacy and everything else in the TikTok app when you finish posting."
+            : "This video is delivered to your TikTok inbox at the scheduled time. TikTok's inbox upload carries no caption field, so your caption is not sent — you type it, along with privacy and everything else, in the TikTok app when you finish posting."}
         </p>
         {isPhoto && (
           // Worth saying plainly: this is the ONLY way to choose a specific
