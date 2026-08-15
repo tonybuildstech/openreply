@@ -55,9 +55,35 @@ function json(body: unknown, status = 200): Response {
  * A stand-in TikTok that answers by endpoint rather than by call order, and
  * fails loudly on anything the photo path has no business requesting.
  */
-function fakeTikTok(options: { error?: { code: string; message?: string } } = {}) {
+function fakeTikTok(
+  options: {
+    error?: { code: string; message?: string };
+    /** What creator_info reports this account may use. */
+    privacyLevelOptions?: string[];
+  } = {}
+) {
   return vi.fn(async (url: string, init?: RequestInit) => {
     const target = String(url);
+
+    // Direct Post re-checks the creator's CURRENT privacy options before init,
+    // because a post scheduled days ago may name a level the account no longer
+    // offers. Inbox posts never reach here — they send no privacy level.
+    if (target.includes("/post/publish/creator_info/query/")) {
+      return json({
+        data: {
+          privacy_level_options: options.privacyLevelOptions ?? [
+            "PUBLIC_TO_EVERYONE",
+            "MUTUAL_FOLLOW_FRIENDS",
+            "FOLLOWER_OF_CREATOR",
+            "SELF_ONLY",
+          ],
+          comment_disabled: false,
+          duet_disabled: false,
+          stitch_disabled: false,
+        },
+        error: { code: "ok", message: "" },
+      });
+    }
 
     if (target.includes("/post/publish/content/init/")) {
       const body = JSON.parse((init?.body as string) ?? "{}") as InitBody;
@@ -241,6 +267,54 @@ describe("TikTok photo carousel publishing", () => {
 
     // Unaudited: warn that this went out private whatever privacy was asked for.
     expect(result.notice).toMatch(/private/i);
+  });
+
+  it("refuses to post when the creator no longer allows the chosen privacy level", async () => {
+    // The account went private between scheduling and publishing, so
+    // PUBLIC_TO_EVERYONE is gone from what TikTok offers.
+    vi.stubGlobal(
+      "fetch",
+      fakeTikTok({
+        privacyLevelOptions: [
+          "FOLLOWER_OF_CREATOR",
+          "MUTUAL_FOLLOW_FRIENDS",
+          "SELF_ONLY",
+        ],
+      })
+    );
+
+    await expect(
+      publish(
+        makePost([photo(0), photo(1)], "caption", {
+          privacyLevel: "PUBLIC_TO_EVERYONE",
+        }),
+        account("DIRECT_POST")
+      )
+    ).rejects.toThrow(/no longer allows/i);
+
+    // Nothing was published. Silently downgrading to a level the account DOES
+    // allow would post more privately than the user asked for without telling
+    // them, which TikTok's own UX guidelines warn against.
+    expect(calls).toHaveLength(0);
+  });
+
+  it("still publishes when the chosen privacy level is one the creator offers", async () => {
+    vi.stubGlobal(
+      "fetch",
+      fakeTikTok({ privacyLevelOptions: ["SELF_ONLY", "MUTUAL_FOLLOW_FRIENDS"] })
+    );
+
+    await publish(
+      makePost([photo(0), photo(1)], "caption", {
+        privacyLevel: "MUTUAL_FOLLOW_FRIENDS",
+      }),
+      account("DIRECT_POST")
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].body.post_info?.privacy_level).toBe(
+      "MUTUAL_FOLLOW_FRIENDS"
+    );
   });
 
   it("puts the caption in description, where TikTok's own example puts hashtags", async () => {

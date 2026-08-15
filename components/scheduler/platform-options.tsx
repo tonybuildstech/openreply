@@ -30,6 +30,25 @@ interface PlatformOptionsProps {
   photoCount?: number;
   /** TikTok only — INBOX needs no options at all. */
   tiktokPostMode?: "INBOX" | "DIRECT_POST" | null;
+  /**
+   * Live settings from `/v2/post/publish/creator_info/query/`. TikTok requires
+   * the privacy options and interaction toggles to reflect these rather than a
+   * hardcoded list. Null while loading, or when the call failed — the UI then
+   * falls back to the full list rather than blocking, since the publish path
+   * re-verifies against the creator's settings before posting anyway.
+   */
+  tiktokCreatorInfo?: TikTokCreatorInfoView | null;
+}
+
+/** Mirrors `TikTokCreatorInfo` from the adapter, over the wire. */
+export interface TikTokCreatorInfoView {
+  creatorNickname?: string;
+  creatorUsername?: string;
+  privacyLevelOptions: string[];
+  commentDisabled: boolean;
+  duetDisabled: boolean;
+  stitchDisabled: boolean;
+  maxVideoPostDurationSec?: number;
 }
 
 // ─── Field primitives ───────────────────────────────────────────────────────
@@ -293,8 +312,17 @@ function YouTubeOptions({
   );
 }
 
+/**
+ * Labels for every level TikTok defines. Which of these are actually OFFERED is
+ * decided by `creator_info` at composer time, never by this list — a public
+ * account gets PUBLIC/FRIENDS/ONLY-ME, a private one gets
+ * FOLLOWERS/FRIENDS/ONLY-ME. `FOLLOWER_OF_CREATOR` was missing here entirely,
+ * so private-account creators were offered a level they cannot use
+ * (`PUBLIC_TO_EVERYONE`) and denied the one they can.
+ */
 const TIKTOK_PRIVACY_LEVELS = [
   { value: "PUBLIC_TO_EVERYONE", label: "Everyone" },
+  { value: "FOLLOWER_OF_CREATOR", label: "Followers" },
   { value: "MUTUAL_FOLLOW_FRIENDS", label: "Friends" },
   { value: "SELF_ONLY", label: "Only me" },
 ] as const;
@@ -305,9 +333,15 @@ function TikTokOptions({
   onChange,
   photoCount,
   tiktokPostMode,
+  tiktokCreatorInfo: creatorInfo,
 }: Pick<
   PlatformOptionsProps,
-  "mediaType" | "value" | "onChange" | "photoCount" | "tiktokPostMode"
+  | "mediaType"
+  | "value"
+  | "onChange"
+  | "photoCount"
+  | "tiktokPostMode"
+  | "tiktokCreatorInfo"
 >) {
   const isPhoto = mediaType === "TIKTOK_PHOTO";
 
@@ -392,16 +426,26 @@ function TikTokOptions({
           <option value="" disabled>
             Choose…
           </option>
-          {TIKTOK_PRIVACY_LEVELS.map((level) => (
-            <option
-              key={level.value}
-              value={level.value}
-              // TikTok policy: branded content may not be private.
-              disabled={brandedContent && level.value === "SELF_ONLY"}
-            >
-              {level.label}
-            </option>
-          ))}
+          {TIKTOK_PRIVACY_LEVELS
+            // Offer only what THIS creator can actually use. Until creator_info
+            // arrives (or if the call failed) fall back to the full list rather
+            // than an empty dropdown — the publish path re-verifies anyway.
+            .filter(
+              (level) =>
+                !creatorInfo ||
+                creatorInfo.privacyLevelOptions.length === 0 ||
+                creatorInfo.privacyLevelOptions.includes(level.value)
+            )
+            .map((level) => (
+              <option
+                key={level.value}
+                value={level.value}
+                // TikTok policy: branded content may not be private.
+                disabled={brandedContent && level.value === "SELF_ONLY"}
+              >
+                {level.label}
+              </option>
+            ))}
         </select>
       </Field>
 
@@ -444,25 +488,66 @@ function TikTokOptions({
         </fieldset>
       )}
 
+      {/* Video only — TikTok does not document is_aigc on the photo endpoint. */}
+      {!isPhoto && (
+        <fieldset className="space-y-2.5">
+          <legend className="mb-1 text-sm font-medium text-foreground">
+            Content source
+          </legend>
+          <Toggle
+            label="AI-generated content"
+            hint="Adds TikTok's “Creator labeled as AI-generated” tag. TikTok expects AI content to carry it, and may restrict posts that do not."
+            checked={value.isAigc ?? false}
+            onChange={(checked) => onChange({ isAigc: checked })}
+          />
+        </fieldset>
+      )}
+
       <fieldset className="space-y-2.5">
         <legend className="mb-1 text-sm font-medium text-foreground">
           Interactions
         </legend>
+        {/* When the creator has turned an interaction off account-wide, TikTok
+            forces it off for the post too and the guidelines require the
+            control to reflect that. Shown as checked-and-locked rather than
+            hidden, so the state is visible instead of merely absent.
+            Duet/Stitch are video-only signals — TikTok says to ignore them for
+            photo posts, and the photo branch below never renders them. */}
         <Toggle
           label="Disable comments"
-          checked={value.disableComment ?? false}
+          hint={
+            creatorInfo?.commentDisabled
+              ? "You have comments turned off for your whole account, so this post cannot allow them."
+              : undefined
+          }
+          checked={creatorInfo?.commentDisabled || (value.disableComment ?? false)}
+          disabled={creatorInfo?.commentDisabled}
           onChange={(checked) => onChange({ disableComment: checked })}
         />
         {!isPhoto && (
           <>
             <Toggle
               label="Disable Duet"
-              checked={value.disableDuet ?? false}
+              hint={
+                creatorInfo?.duetDisabled
+                  ? "Duet is off for your whole account."
+                  : undefined
+              }
+              checked={creatorInfo?.duetDisabled || (value.disableDuet ?? false)}
+              disabled={creatorInfo?.duetDisabled}
               onChange={(checked) => onChange({ disableDuet: checked })}
             />
             <Toggle
               label="Disable Stitch"
-              checked={value.disableStitch ?? false}
+              hint={
+                creatorInfo?.stitchDisabled
+                  ? "Stitch is off for your whole account."
+                  : undefined
+              }
+              checked={
+                creatorInfo?.stitchDisabled || (value.disableStitch ?? false)
+              }
+              disabled={creatorInfo?.stitchDisabled}
               onChange={(checked) => onChange({ disableStitch: checked })}
             />
           </>
@@ -543,6 +628,7 @@ export default function PlatformOptions({
   onChange,
   photoCount,
   tiktokPostMode,
+  tiktokCreatorInfo,
 }: PlatformOptionsProps) {
   switch (platform) {
     case "INSTAGRAM":
@@ -563,6 +649,7 @@ export default function PlatformOptions({
           onChange={onChange}
           photoCount={photoCount}
           tiktokPostMode={tiktokPostMode}
+          tiktokCreatorInfo={tiktokCreatorInfo}
         />
       );
     case "FACEBOOK_PAGE":

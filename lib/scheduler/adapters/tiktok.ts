@@ -94,8 +94,108 @@ const PHOTO_URL_TTL_MS = 4 * 60 * 60 * 1000;
 const MAX_DESCRIPTION_CHARS = 4000;
 /** ...and on its title. Both are counted in UTF-16 runes. */
 const MAX_TITLE_CHARS = 90;
+/**
+ * A video's caption goes in `post_info.title`, and its ceiling is far higher
+ * than the photo title's 90 — 2200 UTF-16 runes (research 2026-08-14). Video
+ * has NO `description` field; sending one is undocumented and rejected as
+ * `invalid_param`, so the caption must never be split across two keys here.
+ */
+const MAX_VIDEO_TITLE_CHARS = 2200;
 
 export type TikTokPostMode = "INBOX" | "DIRECT_POST";
+
+export type TikTokPrivacyLevel =
+  | "PUBLIC_TO_EVERYONE"
+  | "MUTUAL_FOLLOW_FRIENDS"
+  | "FOLLOWER_OF_CREATOR"
+  | "SELF_ONLY";
+
+/**
+ * What `/v2/post/publish/creator_info/query/` tells us about one creator.
+ *
+ * TikTok requires this to be queried when rendering the post page, and the
+ * values are per-creator and mutable — a private account, for instance, is
+ * never offered `PUBLIC_TO_EVERYONE`, and gets `FOLLOWER_OF_CREATOR` instead.
+ * Hardcoding the privacy list (which is what we did before) therefore offers
+ * levels the account cannot use, and the post fails at publish with
+ * `privacy_level_option_mismatch` — after the video has finished uploading.
+ */
+export interface TikTokCreatorInfo {
+  creatorUsername?: string;
+  creatorNickname?: string;
+  creatorAvatarUrl?: string;
+  privacyLevelOptions: TikTokPrivacyLevel[];
+  commentDisabled: boolean;
+  /** Video-only signals; TikTok says to ignore them for photo-only posts. */
+  duetDisabled: boolean;
+  stitchDisabled: boolean;
+  maxVideoPostDurationSec?: number;
+}
+
+/**
+ * Current posting settings for the creator behind `accessPlaintextToken`.
+ *
+ * Deliberately NOT cached: the whole point is that these values are live, and a
+ * creator can flip their account to private between scheduling a post and the
+ * worker publishing it.
+ */
+export async function queryCreatorInfo(
+  accessPlaintextToken: string
+): Promise<TikTokCreatorInfo> {
+  const data = await tiktokRequest(
+    "/post/publish/creator_info/query/",
+    accessPlaintextToken,
+    {},
+    "TikTok creator info"
+  );
+
+  const options = Array.isArray(data.privacy_level_options)
+    ? (data.privacy_level_options as TikTokPrivacyLevel[])
+    : [];
+
+  return {
+    creatorUsername: data.creator_username as string | undefined,
+    creatorNickname: data.creator_nickname as string | undefined,
+    creatorAvatarUrl: data.creator_avatar_url as string | undefined,
+    privacyLevelOptions: options,
+    commentDisabled: data.comment_disabled === true,
+    duetDisabled: data.duet_disabled === true,
+    stitchDisabled: data.stitch_disabled === true,
+    maxVideoPostDurationSec:
+      typeof data.max_video_post_duration_sec === "number"
+        ? data.max_video_post_duration_sec
+        : undefined,
+  };
+}
+
+/**
+ * Confirms the privacy level chosen at schedule time is still one the creator
+ * can use, and fails loudly when it is not.
+ *
+ * A scheduler can sit on a choice for days, and TikTok's guidance covers only
+ * synchronous "Export to TikTok" flows — it never says what to do when the
+ * account changed in between. We verify rather than re-map: silently downgrading
+ * someone's privacy choice is the one behaviour TikTok's UX guidelines
+ * explicitly warn against, so a clear failure the user can act on beats a post
+ * that quietly went out more visibly (or less) than they asked for.
+ *
+ * Non-permanent on purpose — the creator can flip the setting back and retry.
+ */
+function assertPrivacyStillAllowed(
+  chosen: TikTokPrivacyLevel,
+  info: TikTokCreatorInfo
+): void {
+  // An empty list means TikTok told us nothing useful; treating that as "reject
+  // everything" would fail posts over a transient API quirk.
+  if (info.privacyLevelOptions.length === 0) return;
+  if (info.privacyLevelOptions.includes(chosen)) return;
+
+  throw new PublishError(
+    `TikTok no longer allows "${chosen}" for this account — it now offers ${info.privacyLevelOptions.join(", ")}. ` +
+      "This usually means the account switched between public and private. Edit the post's privacy setting and reschedule.",
+    false
+  );
+}
 
 export interface TikTokAccountMetadata {
   postMode?: TikTokPostMode;
@@ -106,11 +206,7 @@ export interface TikTokAccountMetadata {
 
 export interface TikTokPostOptions {
   /** Chosen by the user in the composer — TikTok forbids a default. */
-  privacyLevel?:
-    | "PUBLIC_TO_EVERYONE"
-    | "MUTUAL_FOLLOW_FRIENDS"
-    | "FOLLOWER_OF_CREATOR"
-    | "SELF_ONLY";
+  privacyLevel?: TikTokPrivacyLevel;
   disableComment?: boolean;
   /** Video only — TikTok's photo endpoint documents neither. */
   disableDuet?: boolean;
@@ -118,6 +214,16 @@ export interface TikTokPostOptions {
   videoCoverTimestampMs?: number;
   brandContentToggle?: boolean;
   brandOrganicToggle?: boolean;
+  /**
+   * Marks the video as AI-generated, which makes TikTok attach its "Creator
+   * labeled as AI-generated" tag. **Video Direct Post only** — the photo
+   * endpoint does not document it (research 2026-08-14).
+   *
+   * Omitting it defaults to false, so the risk of not sending it is a policy
+   * one rather than a schema one: TikTok expects AI content to carry the label
+   * and may restrict or remove it when unlabeled.
+   */
+  isAigc?: boolean;
 
   // --- Photo carousels only ---
 
@@ -325,6 +431,15 @@ async function schedulePhotoCarousel(
 
   const isDirect = (metadata.postMode ?? "INBOX") === "DIRECT_POST";
 
+  // Only Direct Post carries a privacy level, so only Direct Post can fall out
+  // of step with the creator's current settings.
+  if (isDirect) {
+    assertPrivacyStillAllowed(
+      options.privacyLevel ?? "SELF_ONLY",
+      await queryCreatorInfo(accessPlaintextToken)
+    );
+  }
+
   // Clamped rather than trusted: a stored index left over from an edit that
   // removed items would otherwise be rejected by TikTok as out of range.
   const coverIndex = Math.min(
@@ -428,6 +543,17 @@ export const tiktokAdapter: PublishAdapter = {
     }
 
     const postMode: TikTokPostMode = metadata.postMode ?? "INBOX";
+
+    // Checked before a single byte is uploaded. The caption only reaches TikTok
+    // on the Direct Post path — inbox init carries no `post_info` — so an
+    // over-long caption is only a failure there, and failing here saves a
+    // chunked upload of the whole file first.
+    if (postMode === "DIRECT_POST" && post.caption.length > MAX_VIDEO_TITLE_CHARS) {
+      throw new PublishError(
+        `TikTok caps a video caption at ${MAX_VIDEO_TITLE_CHARS} characters — this one is ${post.caption.length}`,
+        false
+      );
+    }
     // A TikTok video post publishes one file. Throws on a carousel rather than
     // silently sending its first item.
     const media = requireSingleMedia(post);
@@ -444,6 +570,16 @@ export const tiktokAdapter: PublishAdapter = {
     };
 
     const isDirect = postMode === "DIRECT_POST";
+
+    // Before the chunked upload, not after: a rejected init once the whole file
+    // has transferred wastes the creator's bandwidth and ours.
+    if (isDirect) {
+      assertPrivacyStillAllowed(
+        options.privacyLevel ?? "SELF_ONLY",
+        await queryCreatorInfo(accessPlaintextToken)
+      );
+    }
+
     const initPath = isDirect
       ? "/post/publish/video/init/"
       : "/post/publish/inbox/video/init/";
@@ -461,12 +597,16 @@ export const tiktokAdapter: PublishAdapter = {
             ...(options.videoCoverTimestampMs !== undefined
               ? { video_cover_timestamp_ms: options.videoCoverTimestampMs }
               : {}),
-            ...(options.brandContentToggle !== undefined
-              ? { brand_content_toggle: options.brandContentToggle }
-              : {}),
-            ...(options.brandOrganicToggle !== undefined
-              ? { brand_organic_toggle: options.brandOrganicToggle }
-              : {}),
+            // Sent unconditionally, unlike the cover timestamp above. TikTok's
+            // Direct Post video reference marks both commercial-disclosure
+            // fields REQUIRED (research 2026-08-14) — omitting them when the
+            // composer collected no explicit choice risked a rejected init
+            // *after* the whole video had already been chunk-uploaded. `false`
+            // is also the honest value: it is the answer the disclosure toggle
+            // shows by default, so sending it claims nothing the user did not.
+            brand_content_toggle: options.brandContentToggle ?? false,
+            brand_organic_toggle: options.brandOrganicToggle ?? false,
+            is_aigc: options.isAigc ?? false,
           },
           source_info: sourceInfo,
         }

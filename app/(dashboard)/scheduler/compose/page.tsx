@@ -18,11 +18,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import DateTime24h from "@/components/scheduler/datetime-24h";
 import Link from "next/link";
 import PlatformLogo, {
   AccountAvatar,
 } from "@/components/scheduler/platform-logo";
-import PlatformOptions from "@/components/scheduler/platform-options";
+import PlatformOptions, {
+  type TikTokCreatorInfoView,
+} from "@/components/scheduler/platform-options";
 import MediaTray, {
   itemBlocker,
   type TrayItem,
@@ -140,6 +143,18 @@ export default function ComposePage() {
   const [expanded, setExpanded] = useState<string | null>(null);
   /** Media item whose tagging modal is open, if any. */
   const [taggingId, setTaggingId] = useState<string | null>(null);
+  /**
+   * Live TikTok posting settings per account. `null` means "asked and could not
+   * get them" — the options panel then falls back to the full privacy list
+   * rather than showing an empty dropdown, and the worker re-verifies before
+   * publishing regardless.
+   */
+  const [tiktokCreatorInfo, setTiktokCreatorInfo] = useState<
+    Record<string, TikTokCreatorInfoView | null>
+  >({});
+  /* Which accounts we have already asked about. A ref, not state, so that
+     recording the attempt cannot itself retrigger the effect. */
+  const creatorInfoRequested = useRef<Set<string>>(new Set());
   const [submitting, setSubmitting] = useState(false);
   /** Rendering TikTok's narrower copies — can take a while for 35 photos. */
   const [preparingTikTok, setPreparingTikTok] = useState(false);
@@ -685,6 +700,45 @@ export default function ComposePage() {
   }
 
   /**
+   * Pull each selected TikTok account's live settings.
+   *
+   * TikTok requires the composer to render privacy options and interaction
+   * toggles from `creator_info` rather than a fixed list — the options differ
+   * per creator (a private account cannot post publicly) and can change at any
+   * time. Fetched when the account is first ticked rather than on page load, so
+   * a workspace with TikTok accounts it is not posting to pays nothing.
+   *
+   * Inbox accounts are skipped: nothing on that path sends privacy or
+   * interaction flags, so their settings would not be used.
+   */
+  useEffect(() => {
+    for (const target of targets) {
+      const account = accountById.get(target.connectedAccountId);
+      if (
+        account?.platform !== "TIKTOK" ||
+        account.tiktokPostMode !== "DIRECT_POST" ||
+        creatorInfoRequested.current.has(account.id)
+      ) {
+        continue;
+      }
+      creatorInfoRequested.current.add(account.id);
+
+      const accountId = account.id;
+      void (async () => {
+        const res = await fetch(
+          `/api/scheduler/tiktok/creator-info?connectedAccountId=${encodeURIComponent(accountId)}`
+        ).catch(() => null);
+        const payload = res ? await res.json().catch(() => null) : null;
+        // Store null on failure too, so the panel stops waiting on it.
+        setTiktokCreatorInfo((prev) => ({
+          ...prev,
+          [accountId]: payload?.success ? payload.data : null,
+        }));
+      })();
+    }
+  }, [targets, accountById]);
+
+  /**
    * The strictest lead time the ticked platforms impose, and the first whole
    * minute that satisfies it.
    *
@@ -1151,12 +1205,7 @@ export default function ComposePage() {
       {/* 3 — time */}
       <Card>
         <StepHeading step={3} title="When" />
-        <input
-          type="datetime-local"
-          value={scheduledAt}
-          onChange={(e) => setScheduledAt(e.target.value)}
-          className="rounded-lg border border-border bg-background px-3 py-2 text-sm focus:border-foreground/30 focus:outline-none"
-        />
+        <DateTime24h value={scheduledAt} onChange={setScheduledAt} />
         <p className="mt-2 text-xs text-muted">
           Your local time ({Intl.DateTimeFormat().resolvedOptions().timeZone}).
         </p>
@@ -1371,6 +1420,9 @@ export default function ComposePage() {
                                 value={target.options}
                                 photoCount={media.length}
                                 tiktokPostMode={account.tiktokPostMode}
+                                tiktokCreatorInfo={
+                                  tiktokCreatorInfo[account.id] ?? null
+                                }
                                 onChange={(patch) =>
                                   updateOptions(account.id, patch)
                                 }

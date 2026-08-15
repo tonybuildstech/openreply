@@ -14,6 +14,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { AccountAvatar } from "@/components/scheduler/platform-logo";
+import DateTime24h from "@/components/scheduler/datetime-24h";
 import PlatformOptions from "@/components/scheduler/platform-options";
 import {
   PLATFORM_META,
@@ -340,12 +341,10 @@ export default function EditScheduledPostPage() {
           {/* Time */}
           <section className="rounded-xl border border-border bg-surface p-5">
             <h2 className="mb-4 text-base font-semibold">When</h2>
-            <input
-              type="datetime-local"
+            <DateTime24h
               value={scheduledAt}
-              onChange={(e) => setScheduledAt(e.target.value)}
+              onChange={setScheduledAt}
               disabled={!can("scheduledAt")}
-              className="rounded-lg border border-border bg-background px-3 py-2 text-sm focus:border-foreground/30 focus:outline-none disabled:opacity-60"
             />
             <p className="mt-2 text-xs text-muted">
               {Intl.DateTimeFormat().resolvedOptions().timeZone} · at least{" "}

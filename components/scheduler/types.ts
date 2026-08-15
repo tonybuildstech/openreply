@@ -59,8 +59,19 @@ export interface YouTubeTargetOptions {
 }
 
 export interface TikTokTargetOptions {
-  /** TikTok forbids a pre-selected default — the creator must choose. */
-  privacyLevel?: "PUBLIC_TO_EVERYONE" | "MUTUAL_FOLLOW_FRIENDS" | "SELF_ONLY";
+  /**
+   * TikTok forbids a pre-selected default — the creator must choose.
+   *
+   * `FOLLOWER_OF_CREATOR` is what a PRIVATE account gets in place of
+   * `PUBLIC_TO_EVERYONE`; it was missing here, so private-account creators could
+   * not express the level TikTok actually offers them. The real list comes from
+   * `creator_info` at composer time — this union is only the outer bound.
+   */
+  privacyLevel?:
+    | "PUBLIC_TO_EVERYONE"
+    | "MUTUAL_FOLLOW_FRIENDS"
+    | "FOLLOWER_OF_CREATOR"
+    | "SELF_ONLY";
   disableComment?: boolean;
   /** Video posts only — TikTok's photo endpoint documents neither. */
   disableDuet?: boolean;
@@ -68,6 +79,11 @@ export interface TikTokTargetOptions {
   videoCoverTimestampMs?: number;
   brandContentToggle?: boolean;
   brandOrganicToggle?: boolean;
+  /**
+   * Marks the video as AI-generated so TikTok attaches its "Creator labeled as
+   * AI-generated" tag. Video only — undocumented on the photo endpoint.
+   */
+  isAigc?: boolean;
 
   // --- Photo carousels only ---
 
