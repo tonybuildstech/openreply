@@ -140,14 +140,26 @@ export function itemBlocker(
     };
   }
 
-  if (!range || item.ratioId !== "ORIGINAL") return null;
-  if (item.sourceWidthPx === null || item.sourceHeightPx === null) return null;
+  if (!range) return null;
+  // Mid-render the output still describes the PREVIOUS file, so anything said
+  // here would be about a shape that is already on its way out. `canSubmit`
+  // waits for `cropPending` anyway, so nothing escapes during the gap.
+  if (item.cropPending) return null;
 
-  const ratio = ratioOf(item.sourceWidthPx, item.sourceHeightPx);
+  // Judged on the OUTPUT — the file that will actually publish — rather than on
+  // `ratioId`, which only records what was ASKED for. Trusting the request is
+  // what let a tile show a 4:5 crop while an uncropped 2:3 original was the
+  // thing scheduled, leaving the API to refuse it after everything had
+  // uploaded. Falls back to the source for an item nothing has been applied to.
+  const widthPx = item.outputWidthPx ?? item.sourceWidthPx;
+  const heightPx = item.outputHeightPx ?? item.sourceHeightPx;
+  if (widthPx === null || heightPx === null) return null;
+
+  const ratio = ratioOf(widthPx, heightPx);
   if (isWithinRange(ratio, range)) return null;
 
   return {
-    message: `This photo is ${describeRatio(item.sourceWidthPx, item.sourceHeightPx)} — too ${
+    message: `This photo is ${describeRatio(widthPx, heightPx)} — too ${
       ratio < range.min ? "tall" : "wide"
     } for Instagram, which rejects anything outside 4:5 to 1.91:1.`,
     fix: "CROP",

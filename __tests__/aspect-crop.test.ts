@@ -15,6 +15,10 @@ import {
   ratioOf,
   suggestFixPreset,
 } from "../lib/media/aspect";
+import {
+  itemBlocker,
+  type TrayItem,
+} from "../components/scheduler/media-tray";
 
 /** Instagram's documented feed range: 4:5 to 1.91:1. */
 const FEED_RANGE = { min: 0.8, max: 1.91 };
@@ -443,5 +447,151 @@ describe("describeRatio", () => {
 
   it("falls back to pixel dimensions rather than an unrounded float", () => {
     expect(describeRatio(1234, 567)).toBe("1234×567");
+  });
+});
+
+/**
+ * The composer's own refusal, which has to agree with the server's.
+ *
+ * `validateMediaForPlatform` judges the dimensions the request carries, so
+ * anything the tray waves through on a different basis becomes a rejection
+ * AFTER every file has uploaded — the worst possible moment to learn about it.
+ */
+describe("itemBlocker", () => {
+  const item = (patch: Partial<TrayItem>): TrayItem => ({
+    id: "1",
+    previewUrl: "blob:x",
+    filename: "photo.jpg",
+    mimeType: "image/jpeg",
+    sizeBytes: 2_000_000,
+    kind: "IMAGE",
+    sourceWidthPx: 1080,
+    sourceHeightPx: 1350,
+    outputWidthPx: 1080,
+    outputHeightPx: 1350,
+    ratioId: "ORIGINAL",
+    focus: CENTRED_FOCUS,
+    compressed: false,
+    userTags: [],
+    uploading: false,
+    cropPending: false,
+    error: null,
+    ...patch,
+  });
+
+  it("passes a photo already inside the range", () => {
+    expect(itemBlocker(item({}), FEED_RANGE)).toBeNull();
+  });
+
+  it("blocks an untouched photo outside the range", () => {
+    const blocker = itemBlocker(
+      item({
+        sourceWidthPx: 1080,
+        sourceHeightPx: 1620,
+        outputWidthPx: 1080,
+        outputHeightPx: 1620,
+      }),
+      FEED_RANGE
+    );
+
+    expect(blocker?.fix).toBe("CROP");
+    expect(blocker?.message).toContain("2:3");
+  });
+
+  it("passes a photo whose crop actually landed", () => {
+    expect(
+      itemBlocker(
+        item({
+          ratioId: "PORTRAIT",
+          sourceWidthPx: 1080,
+          sourceHeightPx: 1620,
+          outputWidthPx: 1080,
+          outputHeightPx: 1350,
+        }),
+        FEED_RANGE
+      )
+    ).toBeNull();
+  });
+
+  /**
+   * The regression. A crop can be REQUESTED and not land: the composer uploads
+   * picked files one at a time, so a file still queued when its crop is applied
+   * used to have the crop's result overwritten by its own original upload. The
+   * tile went on showing 4:5 — `ratioId` was never touched — while the request
+   * carried the original 2:3, and Instagram refused it at schedule time.
+   *
+   * Judging `ratioId` instead of the output is what made that invisible here.
+   */
+  it("blocks a photo whose crop was requested but never applied", () => {
+    const blocker = itemBlocker(
+      item({
+        ratioId: "PORTRAIT",
+        sourceWidthPx: 1080,
+        sourceHeightPx: 1620,
+        // The original's dimensions, because the original is the file that
+        // would publish.
+        outputWidthPx: 1080,
+        outputHeightPx: 1620,
+      }),
+      FEED_RANGE
+    );
+
+    expect(blocker?.fix).toBe("CROP");
+    expect(blocker?.message).toContain("2:3");
+  });
+
+  it("stays quiet while the render it would judge is still running", () => {
+    expect(
+      itemBlocker(
+        item({
+          ratioId: "PORTRAIT",
+          cropPending: true,
+          sourceWidthPx: 1080,
+          sourceHeightPx: 1620,
+          outputWidthPx: 1080,
+          outputHeightPx: 1620,
+        }),
+        FEED_RANGE
+      )
+    ).toBeNull();
+  });
+
+  it("says nothing about a file the browser could not probe", () => {
+    expect(
+      itemBlocker(
+        item({
+          sourceWidthPx: null,
+          sourceHeightPx: null,
+          outputWidthPx: null,
+          outputHeightPx: null,
+        }),
+        FEED_RANGE
+      )
+    ).toBeNull();
+  });
+
+  it("reports an oversized file before its shape — the fixes differ", () => {
+    const blocker = itemBlocker(
+      item({ sizeBytes: 12_000_000 }),
+      FEED_RANGE,
+      8 * 1024 * 1024
+    );
+
+    expect(blocker?.fix).toBe("COMPRESS");
+  });
+
+  it("leaves video alone", () => {
+    expect(
+      itemBlocker(
+        item({
+          kind: "VIDEO",
+          outputWidthPx: 1080,
+          outputHeightPx: 1920,
+          sourceWidthPx: 1080,
+          sourceHeightPx: 1920,
+        }),
+        FEED_RANGE
+      )
+    ).toBeNull();
   });
 });

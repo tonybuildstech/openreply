@@ -1,3 +1,5 @@
+"use client";
+
 /**
  * Platform brand marks, inline.
  *
@@ -7,6 +9,7 @@
  * at 20px than a coloured one.
  */
 
+import { useState } from "react";
 import type { PlatformKey } from "@/components/scheduler/platform-meta";
 
 interface PlatformLogoProps {
@@ -104,15 +107,34 @@ export function AccountAvatar({
   const box = size === "sm" ? "h-8 w-8" : "h-11 w-11";
   const badge = size === "sm" ? "h-3.5 w-3.5" : "h-4.5 w-4.5";
 
+  /**
+   * The URL that has already failed to load, if any.
+   *
+   * Every platform hands us a SIGNED, expiring CDN link — Meta's
+   * `profile_picture_url`, TikTok's `avatar_url` — and we store the one issued
+   * at connect time and never re-fetch it. So an avatar that worked for weeks
+   * starts returning 403, and without this the account shows the browser's
+   * broken-image glyph, which reads as "this connection is broken" beside a
+   * perfectly healthy account.
+   *
+   * Held as the URL rather than a boolean so a refreshed link is tried again
+   * instead of being written off by a previous one's failure.
+   */
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+
   return (
     <div className="relative shrink-0">
-      {avatarUrl ? (
+      {avatarUrl && avatarUrl !== failedUrl ? (
         // Platform CDN hostnames vary per account (scontent, ggpht, tiktokcdn,
         // fbsbx), so next/image would need an ever-growing remotePatterns list.
         // eslint-disable-next-line @next/next/no-img-element
         <img
           src={avatarUrl}
           alt=""
+          // Some of these CDNs refuse a Referer they do not recognise, which
+          // fails the same way an expired link does.
+          referrerPolicy="no-referrer"
+          onError={() => setFailedUrl(avatarUrl)}
           className={`${box} rounded-full border border-border object-cover`}
         />
       ) : (

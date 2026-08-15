@@ -328,10 +328,42 @@ export default function ComposePage() {
     };
   }
 
-  function patchItem(id: string, patch: Partial<ComposerMediaItem>) {
+  /**
+   * Patch one item, either with a fixed object or with a function of its
+   * CURRENT state.
+   *
+   * The function form exists because the asynchronous paths here — the initial
+   * upload and a crop re-render — each hold a snapshot of the item taken when
+   * they started, and by the time they land the item may have moved on. Reading
+   * through `current` is how a late write can ask "has anything been applied
+   * since?" instead of assuming it still owns the file.
+   */
+  function patchItem(
+    id: string,
+    patch:
+      | Partial<ComposerMediaItem>
+      | ((current: ComposerMediaItem) => Partial<ComposerMediaItem>)
+  ) {
     setMedia((current) =>
-      current.map((item) => (item.id === id ? { ...item, ...patch } : item))
+      current.map((item) =>
+        item.id === id
+          ? { ...item, ...(typeof patch === "function" ? patch(item) : patch) }
+          : item
+      )
     );
+  }
+
+  /**
+   * Whether this item's published file is something we RENDERED rather than the
+   * file the user picked.
+   *
+   * The rule every late write from `addFiles` answers to: a rendition the user
+   * asked for outranks the original, whichever transfer happens to finish last.
+   * Generation claims alone cannot settle it, because a crop can be applied —
+   * and finish — before the original upload has even started.
+   */
+  function hasRendition(item: ComposerMediaItem): boolean {
+    return item.croppedToRatio !== null || item.compressed;
   }
 
   /** Probe, then upload, each picked file — appended in the order chosen. */
@@ -378,17 +410,31 @@ export default function ComposePage() {
       // Probed before upload so the tray can warn about ratio immediately,
       // rather than after a long transfer.
       const probe = await probeMedia(item.file);
-      patchItem(item.id, {
+      patchItem(item.id, (current) => ({
+        // Always true, whatever has been applied since: this describes the file
+        // the user picked, and the crop overlay is drawn inside that box.
         sourceWidthPx: probe.widthPx,
         sourceHeightPx: probe.heightPx,
-        // Nothing has been applied yet, so what publishes IS the source.
-        outputWidthPx: probe.widthPx,
-        outputHeightPx: probe.heightPx,
-      });
+        // The output is only the source while nothing has been applied — and by
+        // now something may have been. Files upload one at a time, so the last
+        // of a batch waits here long enough to be cropped first, and writing
+        // the source over its output is what made the composer describe a
+        // cropped photo by its ORIGINAL shape: the tile showed 4:5 while the
+        // schedule request carried 2:3, which Instagram rejects.
+        ...(hasRendition(current)
+          ? {}
+          : { outputWidthPx: probe.widthPx, outputHeightPx: probe.heightPx }),
+      }));
 
       // Claimed even though nothing has been cropped yet: the user can pick a
       // ratio while this transfer is still running, and the crop that starts
       // from that click must be able to overrule this result.
+      //
+      // NOT sufficient on its own, which is why the writes below also ask
+      // `hasRendition`. This claim is taken when the transfer STARTS, and the
+      // transfers are sequential — so a crop applied to a file still waiting
+      // its turn claims first, and this later claim would outrank the very
+      // crop it is meant to yield to.
       const stale = claimWrite(item.id);
 
       try {
@@ -398,16 +444,29 @@ export default function ComposePage() {
           item.file.name
         );
         if (stale()) continue;
-        patchItem(item.id, { storageKey, sizeBytes, uploading: false });
+        // Skipped outright once a rendition exists — that file is what the tile
+        // shows and what the user chose. The original stays in storage
+        // unreferenced, exactly as a re-crop leaves its predecessor.
+        patchItem(item.id, (current) =>
+          hasRendition(current)
+            ? {}
+            : { storageKey, sizeBytes, uploading: false }
+        );
       } catch (uploadError) {
         if (stale()) continue;
-        patchItem(item.id, {
-          uploading: false,
-          error:
-            uploadError instanceof Error
-              ? uploadError.message
-              : "Upload failed",
-        });
+        // A failure that no longer matters: the file being published was
+        // rendered from the original, not transferred from it.
+        patchItem(item.id, (current) =>
+          hasRendition(current)
+            ? {}
+            : {
+                uploading: false,
+                error:
+                  uploadError instanceof Error
+                    ? uploadError.message
+                    : "Upload failed",
+              }
+        );
       }
     }
 
@@ -485,16 +544,20 @@ export default function ComposePage() {
           file.name
         );
         if (stale()) return;
-        patchItem(id, {
+        patchItem(id, (current) => ({
           storageKey,
           sizeBytes,
           croppedToRatio: null,
           compressed: false,
-          outputWidthPx: item.sourceWidthPx,
-          outputHeightPx: item.sourceHeightPx,
+          // Read from the item as it is NOW, not from the snapshot this render
+          // started with: "Original" can be clicked before the probe lands, and
+          // the snapshot would then record dimensions of null for a file whose
+          // shape is the one thing we do know.
+          outputWidthPx: current.sourceWidthPx,
+          outputHeightPx: current.sourceHeightPx,
           uploading: false,
           cropPending: false,
-        });
+        }));
         return;
       }
 

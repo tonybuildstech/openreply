@@ -406,4 +406,50 @@ describe("TikTok photo carousel publishing", () => {
       expect(publishError.message).toMatch(/developer console/i);
     }
   });
+
+  /**
+   * TikTok answers an audit refusal with the same "review our integration
+   * guidelines" line it uses for several other rules, so the message alone
+   * cannot be acted on — or even told apart from the others.
+   */
+  it("explains an audit refusal instead of repeating TikTok's guidelines link", async () => {
+    vi.stubGlobal(
+      "fetch",
+      fakeTikTok({
+        error: {
+          code: "unaudited_client_can_only_post_to_private_accounts",
+          message:
+            "Please review our integration guidelines at https://developers.tiktok.com/doc/content-sharing-guidelines/",
+        },
+      })
+    );
+
+    try {
+      await publish(makePost([photo(0), photo(1)]), account());
+      expect.unreachable("should have thrown");
+    } catch (error) {
+      const publishError = error as { retryable: boolean; message: string };
+
+      expect(publishError.retryable).toBe(false);
+      expect(publishError.message).toMatch(/private/i);
+      expect(publishError.message).not.toMatch(/integration guidelines/i);
+    }
+  });
+
+  /** An unrecognised code still has to arrive intact — it is the only handle. */
+  it("keeps the error code on a refusal it has no explanation for", async () => {
+    vi.stubGlobal(
+      "fetch",
+      fakeTikTok({
+        error: { code: "something_new", message: "Please review our guidelines" },
+      })
+    );
+
+    try {
+      await publish(makePost([photo(0), photo(1)]), account());
+      expect.unreachable("should have thrown");
+    } catch (error) {
+      expect((error as Error).message).toContain("(something_new)");
+    }
+  });
 });

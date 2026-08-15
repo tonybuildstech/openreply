@@ -283,6 +283,37 @@ export function planChunks(sizeBytes: number): {
   return { chunkSize, totalChunkCount };
 }
 
+/**
+ * What each refusal actually means, in words the operator can act on.
+ *
+ * TikTok answers several *different* refusals with the same sentence — "Please
+ * review our integration guidelines at …" — which names a documentation page
+ * rather than the rule that was broken. Only `error.code` distinguishes them,
+ * and that is written to `PublishJobLog.responseSnippet`, which nothing in the
+ * dashboard reads. So a failed post used to show the guidelines link and
+ * nothing else, and every one of these causes looked identical.
+ *
+ * Codes are the ones the research round of 2026-08-08 documented; anything not
+ * listed keeps TikTok's own message, with the code appended so it can at least
+ * be looked up.
+ */
+const TIKTOK_ERROR_EXPLANATIONS: Record<string, string> = {
+  url_ownership_unverified:
+    "TikTok will not fetch media from this server. Verify this app's domain or the URL prefix /api/media/public/ in the TikTok developer console — see docs/setup.md.",
+  unaudited_client_can_only_post_to_private_accounts:
+    'TikTok only allows an unaudited app to post privately. Set this account\'s privacy to "Only me" in the composer, or switch the account to Inbox mode and finish the post in the TikTok app.',
+  reached_active_user_cap:
+    "TikTok limits how many creators an unaudited app may post for in a day. Try again tomorrow, or switch this account to Inbox mode.",
+  spam_risk_too_many_posts:
+    "TikTok says this account has posted too many times today. The cap is around 15 per 24 hours, shared across every app that posts for it.",
+  spam_risk_user_banned_from_posting:
+    "TikTok has blocked this account from posting through the API.",
+  access_token_invalid:
+    "TikTok rejected the stored credential. Reconnect this account.",
+  scope_not_authorized:
+    "This TikTok connection is missing a permission it needs. Reconnect the account to grant it.",
+};
+
 async function tiktokRequest(
   path: string,
   accessPlaintextToken: string,
@@ -321,10 +352,15 @@ async function tiktokRequest(
       code === "reached_active_user_cap" ||
       code === "unaudited_client_can_only_post_to_private_accounts";
 
-    const message =
-      code === "url_ownership_unverified"
-        ? `${context}: TikTok will not fetch media from this server. Verify this app's domain or the URL prefix /api/media/public/ in the TikTok developer console — see docs/setup.md.`
-        : `${context}: ${payload.error?.message ?? code ?? `HTTP ${response.status}`}`;
+    const explanation = code ? TIKTOK_ERROR_EXPLANATIONS[code] : undefined;
+    const message = explanation
+      ? `${context}: ${explanation}`
+      : // The code is appended rather than dropped: TikTok's own prose is
+        // frequently the generic guidelines line, and without the code the
+        // failure cannot be told apart from any other refusal — or looked up.
+        `${context}: ${payload.error?.message ?? `HTTP ${response.status}`}${
+          code ? ` (${code})` : ""
+        }`;
 
     throw new PublishError(
       message,
