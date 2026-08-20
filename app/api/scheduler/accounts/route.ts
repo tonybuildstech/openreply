@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/db/client";
 import {
+  isTikTokContentPostingAudited,
   isTikTokDirectPostEnabled,
   isUnifiedInstagramConnectEnabled,
 } from "@/lib/env";
@@ -80,6 +81,14 @@ export async function GET() {
           projectAudited?: boolean;
         };
 
+        /* Read from the environment, NOT from `metadata.auditApproved`.
+           That field was written from the `video.publish` scope flag until the
+           two approvals were separated, so every account connected before then
+           holds a `true` that was never about the audit. The flag is the live
+           answer and needs no backfill; the stored value is only refreshed the
+           next time the post mode is changed. */
+        const auditApproved = isTikTokContentPostingAudited();
+
         return {
           ...account,
           metadata: undefined,
@@ -94,11 +103,17 @@ export async function GET() {
             account.platform === "TIKTOK" &&
             isTikTokDirectPostEnabled() &&
             account.scopes.includes("video.publish"),
+          /* Whether a Direct Post from this app may be seen by anyone but the
+             creator. The composer needs it to decide which privacy levels to
+             offer: `creator_info` reports what the CREATOR may use and knows
+             nothing about the app's audit, so offering its list unfiltered
+             proposes "Everyone" to an install TikTok will refuse. */
+          tiktokAuditApproved: account.platform === "TIKTOK" && auditApproved,
           // Both of these mean "posts will not be publicly visible".
           limitation:
             account.platform === "TIKTOK"
-              ? metadata.postMode === "DIRECT_POST" && !metadata.auditApproved
-                ? "Posts go up privately (SELF_ONLY) until TikTok audits this app."
+              ? metadata.postMode === "DIRECT_POST" && !auditApproved
+                ? 'Posts can only go up privately ("Only me") until TikTok audits this app for Direct Post.'
                 : metadata.postMode === "DIRECT_POST"
                   ? null
                   : "Videos are delivered to your TikTok inbox — you finish posting in the app."
@@ -224,10 +239,13 @@ export async function PATCH(request: NextRequest) {
       metadata: {
         ...existing,
         postMode,
-        // Describes the APP's audit state, not the chosen mode, so it tracks
-        // the flag either way — it is what decides whether the UI warns that
-        // posts will go up privately.
-        auditApproved: directPostApproved,
+        // The AUDIT flag, not the scope flag above. The two are separate
+        // approvals: holding `video.publish` gets as far as calling the Direct
+        // Post endpoints, and only the Content Posting audit lifts SELF_ONLY.
+        // Nothing reads this to make a decision — every caller asks the
+        // environment directly, so an install that passes the audit needs no
+        // backfill — but it is kept current so the stored row is not lying.
+        auditApproved: isTikTokContentPostingAudited(),
       },
     },
   });

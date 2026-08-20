@@ -325,12 +325,49 @@ Create a TikTok developer app with Login Kit and the Content Posting API, reques
 `TIKTOK_CLIENT_SECRET`.
 
 **Connected accounts default to inbox delivery**, meaning that at the scheduled minute
-the video is sent to your TikTok inbox and you tap the notification to finish posting.
-This is deliberate. TikTok forces every post from an unaudited app to private
-(`SELF_ONLY`), and their Content Sharing Guidelines require API clients be "intended for
-a wide audience, not limited to internal groups/private use" — which a self-hosted tool
-is not. If your app does pass TikTok's audit, switch an account to direct posting by
-setting `metadata.postMode` to `DIRECT_POST` on its `ConnectedAccount` row.
+the post is sent to your TikTok inbox and you finish it in the app. This is deliberate.
+TikTok forces every post from an unaudited app to private (`SELF_ONLY`), and their
+Content Sharing Guidelines require API clients be "intended for a wide audience, not
+limited to internal groups/private use" — which a self-hosted tool is not.
+
+**Three separate TikTok approvals, and it is easy to mistake one for another.** They
+arrive at different times and mean different things:
+
+| Approval | What it gets you | Flag |
+|----------|------------------|------|
+| App is live with the Content Posting API | `video.upload` — inbox delivery only | — |
+| `video.publish` scope approved | Permission to *call* the Direct Post endpoints | `TIKTOK_ENABLE_DIRECT_POST` |
+| **Content Posting audit** passed | Direct Post to a public account, publicly visible | `TIKTOK_CONTENT_POSTING_AUDITED` |
+
+Holding the second without the third is the confusing case, and it looks like a bug: the
+composer lets you pick "Everyone", everything uploads, and TikTok refuses the post at the
+scheduled minute with `unaudited_client_can_only_post_to_private_accounts` and a link to
+its guidelines.
+
+**Read that error code literally — it is about the ACCOUNT, not the post.** TikTok's
+[Content Sharing Guidelines](https://developers.tiktok.com/doc/content-sharing-guidelines)
+say an unaudited client "can allow up to 5 users to post in a 24 hour window" and that
+"all user accounts using the API client to post must be set to private at the time of
+posting". So while this app is unaudited, Direct Post works **only** for a creator whose
+TikTok account is currently private — choosing "Only me" does not satisfy it. Content is
+separately capped at `SELF_ONLY` viewership; to make a post public afterwards the creator
+sets the account to public, then changes that post's visibility by hand.
+
+The audit is applied for **separately** at
+<https://developers.tiktok.com/application/content-posting-api> — it is not part of going
+live, which is why an app can be fully in production and still be "unaudited". Once it
+passes, set `TIKTOK_CONTENT_POSTING_AUDITED=true` and restart the web app **and** the
+worker; the full privacy list comes back.
+
+Until then OpenReply refuses these posts while the composer is still open, and says which
+of the two restrictions you have hit, rather than letting them fail at the scheduled
+minute. **For a public account the practical answer is inbox delivery** — it carries no
+audit restriction, posts publicly, and is the only path that lets you choose a sound.
+
+Switch an account between inbox delivery and Direct Post on the **Connections** page —
+the toggle appears once `TIKTOK_ENABLE_DIRECT_POST` is on and the account holds a token
+minted after it. Accounts connected before the flag was set must be reconnected, because
+scopes are baked into the token at authorize time.
 
 ### About media quality
 

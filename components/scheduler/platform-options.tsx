@@ -31,6 +31,17 @@ interface PlatformOptionsProps {
   /** TikTok only — INBOX needs no options at all. */
   tiktokPostMode?: "INBOX" | "DIRECT_POST" | null;
   /**
+   * TikTok only: whether this app has passed the Content Posting audit.
+   *
+   * Decides whether any privacy level other than "Only me" can be offered.
+   * Separate from the `video.publish` scope — an app can hold the scope and
+   * still be refused a public Direct Post — and NOT knowable from
+   * `creator_info`, which describes the creator, not the app. Absent reads as
+   * "not audited", the safe direction: the cost is offering one level fewer,
+   * against a post that fails at the scheduled minute.
+   */
+  tiktokAuditApproved?: boolean;
+  /**
    * Live settings from `/v2/post/publish/creator_info/query/`. TikTok requires
    * the privacy options and interaction toggles to reflect these rather than a
    * hardcoded list. Null while loading, or when the call failed — the UI then
@@ -333,6 +344,7 @@ function TikTokOptions({
   onChange,
   photoCount,
   tiktokPostMode,
+  tiktokAuditApproved,
   tiktokCreatorInfo: creatorInfo,
 }: Pick<
   PlatformOptionsProps,
@@ -341,6 +353,7 @@ function TikTokOptions({
   | "onChange"
   | "photoCount"
   | "tiktokPostMode"
+  | "tiktokAuditApproved"
   | "tiktokCreatorInfo"
 >) {
   const isPhoto = mediaType === "TIKTOK_PHOTO";
@@ -373,6 +386,32 @@ function TikTokOptions({
   }
 
   const brandedContent = value.brandContentToggle ?? false;
+
+  /**
+   * An unaudited app may publish nothing but "Only me".
+   *
+   * One of TWO restrictions TikTok places on an unaudited client, and the
+   * narrower one. See `publicAccountBlocked` below for the other.
+   */
+  const auditRestricted = !tiktokAuditApproved;
+
+  /**
+   * The account is PUBLIC and the app is unaudited — TikTok will refuse this
+   * post outright, whatever privacy level is chosen.
+   *
+   * Their wording: "All user accounts using the API client to post must be set
+   * to private at the time of posting." The refusal is
+   * `unaudited_client_can_only_post_to_private_accounts`, raised at init — at
+   * the scheduled minute, after the files are prepared — and its name is about
+   * the ACCOUNT, not the post. Choosing "Only me" does not satisfy it.
+   *
+   * Inferred from `privacy_level_options` because TikTok exposes no "is this
+   * account private" field: a private account is never offered
+   * PUBLIC_TO_EVERYONE, so being offered it identifies a public one.
+   */
+  const publicAccountBlocked =
+    auditRestricted &&
+    (creatorInfo?.privacyLevelOptions.includes("PUBLIC_TO_EVERYONE") ?? false);
 
   return (
     <div className="space-y-4">
@@ -412,7 +451,11 @@ function TikTokOptions({
 
       <Field
         label={isPhoto ? "Who can see this post" : "Who can see this video"}
-        hint="TikTok requires you to choose — there is no default."
+        hint={
+          auditRestricted
+            ? "TikTok allows only this until it audits the app for Direct Post."
+            : "TikTok requires you to choose — there is no default."
+        }
       >
         <select
           value={value.privacyLevel ?? ""}
@@ -427,14 +470,18 @@ function TikTokOptions({
             Choose…
           </option>
           {TIKTOK_PRIVACY_LEVELS
-            // Offer only what THIS creator can actually use. Until creator_info
-            // arrives (or if the call failed) fall back to the full list rather
-            // than an empty dropdown — the publish path re-verifies anyway.
+            // Two independent filters, and both are about what would be
+            // REFUSED rather than what looks tidy.
             .filter(
               (level) =>
-                !creatorInfo ||
-                creatorInfo.privacyLevelOptions.length === 0 ||
-                creatorInfo.privacyLevelOptions.includes(level.value)
+                // The app's audit: unaudited allows SELF_ONLY and nothing else.
+                (!auditRestricted || level.value === "SELF_ONLY") &&
+                // The creator's own settings. Until creator_info arrives (or if
+                // the call failed) fall back to the full list rather than an
+                // empty dropdown — the publish path re-verifies anyway.
+                (!creatorInfo ||
+                  creatorInfo.privacyLevelOptions.length === 0 ||
+                  creatorInfo.privacyLevelOptions.includes(level.value))
             )
             .map((level) => (
               <option
@@ -448,6 +495,57 @@ function TikTokOptions({
             ))}
         </select>
       </Field>
+
+      {auditRestricted && (
+        <p
+          className={`rounded-md border px-3 py-2 text-xs ${
+            publicAccountBlocked
+              ? "border-error/40 bg-error/5 text-error"
+              : "border-border bg-background text-muted"
+          }`}
+        >
+          {/* Named plainly, with the ways out, because the alternative was a
+              post that uploaded fine and was refused at the scheduled minute
+              with a link to TikTok's guidelines and no indication of which
+              rule it had broken. */}
+          {publicAccountBlocked ? (
+            <>
+              <strong>This account is public, so TikTok will refuse it.</strong>{" "}
+              An app TikTok has not audited may only post to an account that is
+              set to <strong>private</strong> at the time of posting —
+              &quot;Only me&quot; does not satisfy that, the account itself has
+              to be private. Switch this account to{" "}
+              <strong>Send to inbox</strong> on the Connections page and finish
+              in the TikTok app, which posts publicly and is also the only way
+              to pick a sound.
+            </>
+          ) : (
+            <>
+              TikTok only lets an app it has not audited post privately, so
+              &quot;Only me&quot; is the one level available here. The account
+              must also be private while the post goes out.
+            </>
+          )}{" "}
+          Once TikTok has audited this app —{" "}
+          <a
+            href="https://developers.tiktok.com/application/content-posting-api"
+            target="_blank"
+            rel="noreferrer"
+            className="underline"
+          >
+            a separate application
+          </a>{" "}
+          from going live — set <code>TIKTOK_CONTENT_POSTING_AUDITED=true</code>{" "}
+          and restart the web app and the worker.
+          {brandedContent && !publicAccountBlocked && (
+            <>
+              {" "}
+              Branded content cannot be private, so it cannot be posted at all
+              on this path — turn it off, or use inbox delivery.
+            </>
+          )}
+        </p>
+      )}
 
       {/* Video-only. TikTok's photo endpoint documents no cover timestamp, no
           Duet and no Stitch, and the adapter omits those fields entirely — so
@@ -628,6 +726,7 @@ export default function PlatformOptions({
   onChange,
   photoCount,
   tiktokPostMode,
+  tiktokAuditApproved,
   tiktokCreatorInfo,
 }: PlatformOptionsProps) {
   switch (platform) {
@@ -649,6 +748,7 @@ export default function PlatformOptions({
           onChange={onChange}
           photoCount={photoCount}
           tiktokPostMode={tiktokPostMode}
+          tiktokAuditApproved={tiktokAuditApproved}
           tiktokCreatorInfo={tiktokCreatorInfo}
         />
       );

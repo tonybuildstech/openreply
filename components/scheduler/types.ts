@@ -124,6 +124,12 @@ export interface ComposerAccount {
   avatarUrl: string | null;
   status: "ACTIVE" | "NEEDS_REAUTH" | "DISABLED";
   tiktokPostMode: "INBOX" | "DIRECT_POST" | null;
+  /**
+   * TikTok only: this app has passed the Content Posting audit, so a Direct
+   * Post may be something other than "Only me". Distinct from holding the
+   * `video.publish` scope, and invisible to `creator_info`.
+   */
+  tiktokAuditApproved?: boolean;
   limitation: string | null;
 }
 

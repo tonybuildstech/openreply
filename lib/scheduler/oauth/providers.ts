@@ -14,6 +14,7 @@ import type { SocialPlatform } from "@/app/generated/prisma/client";
 import {
   getBaseUrl,
   getMetaGraphApiVersion,
+  isTikTokContentPostingAudited,
   isTikTokDirectPostEnabled,
   requireEnv,
 } from "@/lib/env";
@@ -430,22 +431,20 @@ const tiktokProvider: OAuthProvider = {
       data?: { user?: { display_name?: string; avatar_url?: string } };
     }>(profileResponse, "TikTok profile lookup");
 
-    // Both values follow the app's approval state, because the token being
-    // minted right now does too: `tiktokScopes()` only asked for
-    // `video.publish` under the same flag, so an account connected while the
-    // app is unapproved CANNOT direct post no matter what metadata claims.
+    // `postMode` follows the SCOPE, because the token being minted right now
+    // does too: `tiktokScopes()` only asked for `video.publish` under that
+    // flag, so an account connected while the app lacks it CANNOT direct post
+    // no matter what metadata claims. Either way it stays switchable per
+    // account via PATCH /api/scheduler/accounts.
     //
-    // Unapproved → inbox is the honest default, since TikTok forces every
-    // Direct Post from an unaudited app to SELF_ONLY — a private video the
-    // creator never asked for. Approved → Direct Post is what the user turned
-    // the flag on to get, and the composer already collects TikTok's mandatory
-    // choices (privacy level, interaction toggles, commercial disclosure) for
-    // that path. Either way it stays switchable per account via
-    // PATCH /api/scheduler/accounts.
-    const directPostApproved = isTikTokDirectPostEnabled();
+    // `auditApproved` follows the AUDIT, which is a different approval on a
+    // different timetable — an app can hold `video.publish` and still be
+    // refused anything but SELF_ONLY. Deriving it from the scope flag is what
+    // made the composer offer "Everyone" to an install TikTok considered
+    // unaudited, and the refusal then landed at the scheduled minute.
     const metadata: TikTokAccountMetadata = {
-      postMode: directPostApproved ? "DIRECT_POST" : "INBOX",
-      auditApproved: directPostApproved,
+      postMode: isTikTokDirectPostEnabled() ? "DIRECT_POST" : "INBOX",
+      auditApproved: isTikTokContentPostingAudited(),
       creatorUsername: profile.data?.user?.display_name,
     };
 

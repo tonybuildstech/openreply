@@ -1483,6 +1483,7 @@ export default function ComposePage() {
                                 value={target.options}
                                 photoCount={media.length}
                                 tiktokPostMode={account.tiktokPostMode}
+                                tiktokAuditApproved={account.tiktokAuditApproved}
                                 tiktokCreatorInfo={
                                   tiktokCreatorInfo[account.id] ?? null
                                 }

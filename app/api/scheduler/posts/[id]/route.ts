@@ -5,8 +5,14 @@ import type {
   ScheduledPostMediaKind,
 } from "@/app/generated/prisma/client";
 import { prisma } from "@/lib/db/client";
+import { isTikTokContentPostingAudited } from "@/lib/env";
 import { getPublishQueue } from "@/lib/queue/client";
 import { getAdapter } from "@/lib/scheduler/adapters";
+import {
+  tiktokAuditIssue,
+  type TikTokAccountMetadata,
+  type TikTokPostOptions,
+} from "@/lib/scheduler/adapters/tiktok";
 import {
   PLATFORM_CONSTRAINTS,
   validateCaptionForPlatform,
@@ -150,6 +156,15 @@ export async function GET(
         ...post.connectedAccount,
         metadata: undefined,
         tiktokPostMode: metadata.postMode ?? null,
+        // From the environment, not the stored row: `metadata.auditApproved`
+        // was written from the `video.publish` scope flag before the two
+        // approvals were separated, so older accounts carry a `true` that was
+        // never about the audit. Editing a post must offer the same privacy
+        // levels the composer does, or an edit re-introduces the failure the
+        // composer now prevents.
+        tiktokAuditApproved:
+          post.connectedAccount.platform === "TIKTOK" &&
+          isTikTokContentPostingAudited(),
       },
       policy: getEditPolicy(post.status, post.connectedAccount.platform),
       constraints: PLATFORM_CONSTRAINTS[post.connectedAccount.platform],
@@ -271,6 +286,28 @@ export async function PATCH(
       { success: false, error: windowIssue.message },
       { status: 400 }
     );
+  }
+
+  // Same rule as the create route, against the options this save would leave
+  // in place: an unaudited app cannot Direct Post anything but "Only me", and
+  // an edit must not be the way back into a post that fails at publish.
+  if (platform === "TIKTOK") {
+    const accountMetadata = (post.connectedAccount.metadata ??
+      {}) as TikTokAccountMetadata;
+    const options = (body.platformOptions ??
+      post.platformOptions ??
+      {}) as TikTokPostOptions;
+
+    const auditIssue = tiktokAuditIssue(
+      accountMetadata.postMode,
+      options.privacyLevel
+    );
+    if (auditIssue) {
+      return NextResponse.json(
+        { success: false, error: auditIssue },
+        { status: 400 }
+      );
+    }
   }
 
   // New files: trust storage for size, MIME type and kind, never the client.

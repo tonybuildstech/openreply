@@ -6,6 +6,11 @@ import { prisma } from "@/lib/db/client";
 import { getPublishQueue } from "@/lib/queue/client";
 import { getDispatchMode } from "@/lib/scheduler/adapters";
 import {
+  tiktokAuditIssue,
+  type TikTokAccountMetadata,
+  type TikTokPostOptions,
+} from "@/lib/scheduler/adapters/tiktok";
+import {
   validateCaptionForPlatform,
   validateMediaForPlatform,
   validateScheduleWindow,
@@ -325,6 +330,24 @@ export async function POST(request: NextRequest) {
         error: windowIssue.message,
       });
       continue;
+    }
+
+    // TikTok refuses a public Direct Post from an app it has not audited, and
+    // does so at init — at the scheduled minute. Knowable now, so refused now.
+    if (platform === "TIKTOK") {
+      const metadata = (account.metadata ?? {}) as TikTokAccountMetadata;
+      const options = (target.platformOptions ?? {}) as TikTokPostOptions;
+      const auditIssue = tiktokAuditIssue(
+        metadata.postMode,
+        options.privacyLevel
+      );
+      if (auditIssue) {
+        errors.push({
+          connectedAccountId: target.connectedAccountId,
+          error: auditIssue,
+        });
+        continue;
+      }
     }
 
     if (platform === "YOUTUBE") youtubeTargets += 1;

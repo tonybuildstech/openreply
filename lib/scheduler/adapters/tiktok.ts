@@ -52,6 +52,7 @@ import type {
   ConnectedAccount,
   ScheduledPostMedia,
 } from "@/app/generated/prisma/client";
+import { isTikTokContentPostingAudited } from "@/lib/env";
 import { fetchWithTimeout, toResponseSnippet } from "@/lib/scheduler/http";
 import { recordQuotaUsage } from "@/lib/scheduler/quota";
 import { resolveAccessToken } from "@/lib/scheduler/tokens";
@@ -197,9 +198,89 @@ function assertPrivacyStillAllowed(
   );
 }
 
+/**
+ * The two things TikTok refuses an UNAUDITED client, documented on the Content
+ * Sharing Guidelines and checked here before anything is uploaded.
+ *
+ * Read the error code literally — it cost a debugging session not to:
+ * `unaudited_client_can_only_post_to_private_accounts` is about the ACCOUNT,
+ * not the post. TikTok's wording is "All user accounts using the API client to
+ * post must be set to private at the time of posting", so a public account
+ * cannot be Direct Posted to at all, whatever privacy level is chosen. Picking
+ * "Only me" does not help; it is a second, separate restriction ("all content
+ * posted by unaudited clients will be restricted to private viewing mode").
+ *
+ * Deliberately NOT a silent downgrade. Publishing privately when the user
+ * asked for public is a different post from the one they scheduled, and
+ * quietly substituting it is worse than refusing: they would find out by
+ * noticing nobody saw it.
+ */
+const UNAUDITED_PUBLIC_ACCOUNT_MESSAGE =
+  "TikTok has not audited this app, and an unaudited app may only post to an account that is set to PRIVATE — this one is public. " +
+  'Choosing "Only me" does not satisfy that; the account itself would have to be private while the post goes out. ' +
+  "To publish publicly, switch this account to inbox delivery on the Connections page and finish the post in the TikTok app, or apply for the audit at https://developers.tiktok.com/application/content-posting-api.";
+
+/**
+ * Why this TikTok post cannot be published as configured, or null.
+ *
+ * The half of the restriction that needs no network call: an unaudited client
+ * cannot publish anything but `SELF_ONLY`. Called from the schedule routes so
+ * it lands while the composer is still open, and again from the publish paths,
+ * which catches posts queued before this check existed.
+ *
+ * The other half — whether the ACCOUNT is private — needs `creator_info`, so
+ * it lives in `assertAuditAllowsDirectPost` below, next to the call that
+ * already fetches it.
+ */
+export function tiktokAuditIssue(
+  postMode: TikTokPostMode | undefined,
+  privacyLevel: TikTokPrivacyLevel | undefined
+): string | null {
+  if ((postMode ?? "INBOX") !== "DIRECT_POST") return null;
+  if (isTikTokContentPostingAudited()) return null;
+  // The adapter's own default. A Direct Post with no level chosen goes out
+  // privately, which is the only viewership an unaudited app may publish.
+  if ((privacyLevel ?? "SELF_ONLY") === "SELF_ONLY") return null;
+
+  return (
+    'TikTok has not audited this app, so it can only publish with "Only me" chosen — and only to an account that is set to private. ' +
+    "Switch this account to inbox delivery on the Connections page and finish the post in the TikTok app to publish it publicly."
+  );
+}
+
+/**
+ * Refuse a Direct Post to a PUBLIC account from an unaudited client.
+ *
+ * Inferred from `privacy_level_options` because TikTok exposes no "is this
+ * account private" field: a private account is never offered
+ * `PUBLIC_TO_EVERYONE` (it gets `FOLLOWER_OF_CREATOR` instead), so being
+ * offered it is what identifies a public account. Same inference the composer
+ * makes, from the same call.
+ *
+ * An empty list means TikTok told us nothing useful; treating that as "refuse"
+ * would fail posts over a transient API quirk, so it passes and TikTok gets the
+ * final word — the same way `assertPrivacyStillAllowed` handles it.
+ */
+function assertAuditAllowsDirectPost(info: TikTokCreatorInfo): void {
+  if (isTikTokContentPostingAudited()) return;
+  if (info.privacyLevelOptions.length === 0) return;
+  if (!info.privacyLevelOptions.includes("PUBLIC_TO_EVERYONE")) return;
+
+  throw new PublishError(UNAUDITED_PUBLIC_ACCOUNT_MESSAGE, false);
+}
+
 export interface TikTokAccountMetadata {
   postMode?: TikTokPostMode;
-  /** True once TikTok has audited the app for public Direct Post. */
+  /**
+   * What the app's audit state was when this row was last written.
+   *
+   * **Informational only — never branch on it.** Ask
+   * `isTikTokContentPostingAudited()` instead. This field was written from the
+   * `video.publish` scope flag before the two approvals were separated, so
+   * rows created then carry a `true` that was never about the audit, and an
+   * install that passes the audit later does not rewrite every row. Every read
+   * of this value was a bug; they are listed here so a future one is not.
+   */
   auditApproved?: boolean;
   creatorUsername?: string;
 }
@@ -301,9 +382,11 @@ const TIKTOK_ERROR_EXPLANATIONS: Record<string, string> = {
   url_ownership_unverified:
     "TikTok will not fetch media from this server. Verify this app's domain or the URL prefix /api/media/public/ in the TikTok developer console — see docs/setup.md.",
   unaudited_client_can_only_post_to_private_accounts:
-    'TikTok only allows an unaudited app to post privately. Set this account\'s privacy to "Only me" in the composer, or switch the account to Inbox mode and finish the post in the TikTok app.',
+    "TikTok requires the CREATOR'S ACCOUNT to be set to private while an unaudited app posts to it — choosing \"Only me\" does not satisfy this, the account itself must be private. Switch this account to inbox delivery to post publicly, or apply for the Content Posting API audit at https://developers.tiktok.com/application/content-posting-api.",
+  privacy_level_option_mismatch:
+    "TikTok no longer offers the privacy level this post was scheduled with — the account most likely switched between public and private. Edit the post and choose again.",
   reached_active_user_cap:
-    "TikTok limits how many creators an unaudited app may post for in a day. Try again tomorrow, or switch this account to Inbox mode.",
+    "TikTok limits how many creators an app may post for in a day — 5 in 24 hours while the app is unaudited. Try again tomorrow, or switch this account to inbox delivery.",
   spam_risk_too_many_posts:
     "TikTok says this account has posted too many times today. The cap is around 15 per 24 hours, shared across every app that posts for it.",
   spam_risk_user_banned_from_posting:
@@ -468,12 +551,19 @@ async function schedulePhotoCarousel(
   const isDirect = (metadata.postMode ?? "INBOX") === "DIRECT_POST";
 
   // Only Direct Post carries a privacy level, so only Direct Post can fall out
-  // of step with the creator's current settings.
+  // of step with the app's audit or the creator's current settings.
   if (isDirect) {
-    assertPrivacyStillAllowed(
-      options.privacyLevel ?? "SELF_ONLY",
-      await queryCreatorInfo(accessPlaintextToken)
-    );
+    // Checked at schedule time too. This catches posts queued before that
+    // check existed, and turns TikTok's opaque refusal into the same words.
+    const auditIssue = tiktokAuditIssue(metadata.postMode, options.privacyLevel);
+    if (auditIssue) throw new PublishError(auditIssue, false);
+
+    const info = await queryCreatorInfo(accessPlaintextToken);
+    // Before the privacy check: "your account has to be private for this app to
+    // post at all" is the more fundamental answer, and reporting the narrower
+    // privacy mismatch first would send the user off to fix the wrong thing.
+    assertAuditAllowsDirectPost(info);
+    assertPrivacyStillAllowed(options.privacyLevel ?? "SELF_ONLY", info);
   }
 
   // Clamped rather than trusted: a stored index left over from an edit that
@@ -548,10 +638,13 @@ async function schedulePhotoCarousel(
     posts: 1,
   });
 
+  // From the environment, like every other audit decision here. Reading
+  // `metadata.auditApproved` meant a row written before the scope flag and the
+  // audit flag were separated could claim an audit the app never had.
   const notice = isDirect
-    ? metadata.auditApproved
+    ? isTikTokContentPostingAudited()
       ? undefined
-      : "Posted privately (SELF_ONLY). TikTok restricts every post from an unaudited app to private — open TikTok to change its visibility."
+      : 'Posted privately ("Only me"). TikTok restricts every post from an unaudited app to private — open TikTok to change its visibility.'
     : "Sent to your TikTok inbox. Open the TikTok app to choose a sound and finish posting.";
 
   return { containerId: publishId, notice };
@@ -610,10 +703,12 @@ export const tiktokAdapter: PublishAdapter = {
     // Before the chunked upload, not after: a rejected init once the whole file
     // has transferred wastes the creator's bandwidth and ours.
     if (isDirect) {
-      assertPrivacyStillAllowed(
-        options.privacyLevel ?? "SELF_ONLY",
-        await queryCreatorInfo(accessPlaintextToken)
-      );
+      const auditIssue = tiktokAuditIssue(postMode, options.privacyLevel);
+      if (auditIssue) throw new PublishError(auditIssue, false);
+
+      const info = await queryCreatorInfo(accessPlaintextToken);
+      assertAuditAllowsDirectPost(info);
+      assertPrivacyStillAllowed(options.privacyLevel ?? "SELF_ONLY", info);
     }
 
     const initPath = isDirect
@@ -674,9 +769,9 @@ export const tiktokAdapter: PublishAdapter = {
     });
 
     const notice = isDirect
-      ? metadata.auditApproved
+      ? isTikTokContentPostingAudited()
         ? undefined
-        : "Posted privately (SELF_ONLY). TikTok restricts every post from an unaudited app to private — open TikTok to change its visibility."
+        : 'Posted privately ("Only me"). TikTok restricts every post from an unaudited app to private — open TikTok to change its visibility.'
       : "Sent to your TikTok inbox. Open the TikTok app and tap the notification to finish posting.";
 
     return { containerId: publishId, notice };

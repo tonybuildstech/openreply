@@ -138,12 +138,26 @@ function account(postMode?: "INBOX" | "DIRECT_POST", auditApproved = false) {
   } as never;
 }
 
+/**
+ * Put the APP on the far side of TikTok's Content Posting audit.
+ *
+ * An environment flag rather than account metadata, and deliberately so: the
+ * audit is a property of the app, and reading it off the row is what let an
+ * account connected before the scope and audit flags were separated claim an
+ * approval it never had. Any test that posts publicly needs this — without it
+ * TikTok accepts SELF_ONLY and nothing else.
+ */
+function audited() {
+  vi.stubEnv("TIKTOK_CONTENT_POSTING_AUDITED", "true");
+}
+
 beforeEach(() => {
   calls = [];
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   vi.clearAllMocks();
 });
 
@@ -193,6 +207,9 @@ describe("TikTok photo carousel publishing", () => {
   });
 
   it("never sends the video-only fields, even as false", async () => {
+    // About field omission, not the audit — and the default creator here is a
+    // public account, which an unaudited client may not Direct Post to at all.
+    audited();
     vi.stubGlobal("fetch", fakeTikTok());
 
     await publish(
@@ -242,6 +259,7 @@ describe("TikTok photo carousel publishing", () => {
   });
 
   it("sends the Direct Post fields, with explicit brand booleans, when the account asks for it", async () => {
+    audited();
     vi.stubGlobal("fetch", fakeTikTok());
 
     const result = await publish(
@@ -265,11 +283,14 @@ describe("TikTok photo carousel publishing", () => {
     expect(postInfo.brand_content_toggle).toBe(false);
     expect(postInfo.brand_organic_toggle).toBe(false);
 
-    // Unaudited: warn that this went out private whatever privacy was asked for.
-    expect(result.notice).toMatch(/private/i);
+    // Audited, so the post goes out as asked and there is nothing to warn
+    // about. The unaudited case does not reach here at all — it is refused
+    // before init, because TikTok does not downgrade it, it rejects it.
+    expect(result.notice).toBeUndefined();
   });
 
   it("refuses to post when the creator no longer allows the chosen privacy level", async () => {
+    audited();
     // The account went private between scheduling and publishing, so
     // PUBLIC_TO_EVERYONE is gone from what TikTok offers.
     vi.stubGlobal(
@@ -299,6 +320,7 @@ describe("TikTok photo carousel publishing", () => {
   });
 
   it("still publishes when the chosen privacy level is one the creator offers", async () => {
+    audited();
     vi.stubGlobal(
       "fetch",
       fakeTikTok({ privacyLevelOptions: ["SELF_ONLY", "MUTUAL_FOLLOW_FRIENDS"] })
@@ -434,6 +456,140 @@ describe("TikTok photo carousel publishing", () => {
       expect(publishError.message).toMatch(/private/i);
       expect(publishError.message).not.toMatch(/integration guidelines/i);
     }
+  });
+
+  /**
+   * The Content Posting audit, which is NOT the `video.publish` scope.
+   *
+   * An app can hold the scope — enough to call the Direct Post endpoints — and
+   * still be refused any privacy level but SELF_ONLY. The two were one flag
+   * until an install with the scope scheduled a public carousel and TikTok
+   * refused it at the scheduled minute, so these pin them apart.
+   */
+  it("refuses a public Direct Post before contacting TikTok when unaudited", async () => {
+    vi.stubGlobal("fetch", fakeTikTok());
+
+    await expect(
+      publish(
+        makePost([photo(0), photo(1)], "caption", {
+          privacyLevel: "PUBLIC_TO_EVERYONE",
+        }),
+        account("DIRECT_POST")
+      )
+    ).rejects.toThrow(/audited/i);
+
+    // Not one request, not even creator_info: the answer is knowable without
+    // asking, and the point is to fail before anything is prepared.
+    expect(calls).toHaveLength(0);
+  });
+
+  /**
+   * The restriction the error code actually names, and the one that reading it
+   * loosely gets wrong.
+   *
+   * `unaudited_client_can_only_post_to_private_accounts` is about the ACCOUNT:
+   * "all user accounts using the API client to post must be set to private at
+   * the time of posting". So SELF_ONLY does NOT rescue a public account, and
+   * advising it sends the user to change a setting that cannot help.
+   *
+   * A public account is identified by TikTok offering PUBLIC_TO_EVERYONE — a
+   * private one is offered FOLLOWER_OF_CREATOR instead.
+   */
+  it("refuses an unaudited Direct Post to a PUBLIC account even with SELF_ONLY", async () => {
+    vi.stubGlobal(
+      "fetch",
+      fakeTikTok({
+        privacyLevelOptions: [
+          "PUBLIC_TO_EVERYONE",
+          "MUTUAL_FOLLOW_FRIENDS",
+          "SELF_ONLY",
+        ],
+      })
+    );
+
+    try {
+      await publish(
+        makePost([photo(0), photo(1)], "caption", {
+          privacyLevel: "SELF_ONLY",
+        }),
+        account("DIRECT_POST")
+      );
+      expect.unreachable("should have thrown");
+    } catch (error) {
+      const publishError = error as { retryable: boolean; message: string };
+
+      expect(publishError.retryable).toBe(false);
+      // Must say the ACCOUNT, and must not suggest picking "Only me" — that is
+      // the level already chosen here, and it changed nothing.
+      expect(publishError.message).toMatch(/private/i);
+      expect(publishError.message).toMatch(/inbox/i);
+    }
+
+    // creator_info was consulted; nothing was published.
+    expect(calls).toHaveLength(0);
+  });
+
+  it("allows an unaudited Direct Post when the account itself is private", async () => {
+    // No PUBLIC_TO_EVERYONE on offer — TikTok's own signal for a private one.
+    vi.stubGlobal(
+      "fetch",
+      fakeTikTok({
+        privacyLevelOptions: ["FOLLOWER_OF_CREATOR", "SELF_ONLY"],
+      })
+    );
+
+    const result = await publish(
+      makePost([photo(0), photo(1)], "caption", {
+        privacyLevel: "SELF_ONLY",
+      }),
+      account("DIRECT_POST")
+    );
+
+    expect(calls[0].body.post_info?.privacy_level).toBe("SELF_ONLY");
+    // Said plainly, because "published" and "anyone can see it" are not the
+    // same thing here and the difference is the creator's to act on.
+    expect(result.notice).toMatch(/privately/i);
+  });
+
+  it("lets an audited app post to a public account", async () => {
+    audited();
+    vi.stubGlobal("fetch", fakeTikTok());
+
+    const result = await publish(
+      makePost([photo(0), photo(1)], "caption", {
+        privacyLevel: "PUBLIC_TO_EVERYONE",
+      }),
+      account("DIRECT_POST")
+    );
+
+    expect(calls[0].body.post_info?.privacy_level).toBe("PUBLIC_TO_EVERYONE");
+    expect(result.notice).toBeUndefined();
+  });
+
+  it("ignores a stale auditApproved on the account row", async () => {
+    // Written from the scope flag before the two approvals were separated.
+    // Trusting it is exactly the bug: the app is not audited, whatever the
+    // row says, and TikTok is the one that decides.
+    vi.stubGlobal("fetch", fakeTikTok());
+
+    await expect(
+      publish(
+        makePost([photo(0), photo(1)], "caption", {
+          privacyLevel: "PUBLIC_TO_EVERYONE",
+        }),
+        account("DIRECT_POST", true)
+      )
+    ).rejects.toThrow(/audited/i);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("leaves the inbox path alone — it carries no privacy level to refuse", async () => {
+    vi.stubGlobal("fetch", fakeTikTok());
+
+    const result = await publish(makePost([photo(0), photo(1)]), account());
+
+    expect(calls).toHaveLength(1);
+    expect(result.notice).toMatch(/inbox/i);
   });
 
   /** An unrecognised code still has to arrive intact — it is the only handle. */

@@ -53,14 +53,17 @@ export function isUnifiedInstagramConnectEnabled(): boolean {
 /**
  * True once TikTok has approved the `video.publish` scope for this app.
  *
- * This one flag means two things, because they are the same fact:
+ * Controls one thing: whether `video.publish` is added to the authorize call.
+ * TikTok REJECTS an authorize request carrying a scope the app is not approved
+ * for, so turning this on early breaks connecting entirely.
  *
- *  1. **Request the scope.** `video.publish` is added to the authorize call.
- *     TikTok REJECTS an authorize request carrying a scope the app is not
- *     approved for, so turning this on early breaks connecting entirely.
- *  2. **The app passed the Content Posting audit.** Until it has, TikTok forces
- *     every Direct Post to SELF_ONLY, which is why new accounts default to
- *     inbox delivery — see `lib/scheduler/oauth/providers.ts`.
+ * **It does NOT mean posts can be public.** These were one flag until an
+ * unaudited install with the scope approved scheduled a public photo carousel
+ * and TikTok refused it at the scheduled minute with
+ * `unaudited_client_can_only_post_to_private_accounts`. Holding the scope gets
+ * you as far as calling the Direct Post endpoints; the Content Posting audit is
+ * a separate gate, and only that one lifts SELF_ONLY. See
+ * `isTikTokContentPostingAudited` below.
  *
  * Opt-in, and unset MUST read as "not approved" — the failure mode for guessing
  * wrong in that direction is every TikTok connection attempt breaking. But the
@@ -72,6 +75,32 @@ const TRUTHY = ["true", "1", "yes", "on"];
 
 export function isTikTokDirectPostEnabled(): boolean {
   const raw = process.env.TIKTOK_ENABLE_DIRECT_POST?.trim().toLowerCase();
+  return raw !== undefined && TRUTHY.includes(raw);
+}
+
+/**
+ * True once this app has passed TikTok's **Content Posting audit**.
+ *
+ * The gate that decides whether a Direct Post may be seen by anyone other than
+ * the creator. Until it is passed, TikTok accepts only `SELF_ONLY` and refuses
+ * anything else with `unaudited_client_can_only_post_to_private_accounts` — at
+ * init, at the scheduled minute, after the composer has already offered
+ * "Everyone" and the user has picked it.
+ *
+ * Nothing in the API reports this state: `creator_info` returns the levels the
+ * CREATOR may use and says nothing about the app's audit, so the composer
+ * cannot infer it and has to be told. Hence a flag rather than a lookup.
+ *
+ * Separate from `TIKTOK_ENABLE_DIRECT_POST` because the two approvals are
+ * separate, arrive at different times, and an install can genuinely hold the
+ * first without the second — which is exactly the case that failed.
+ *
+ * Unset reads as "not audited", the same direction as every other flag here:
+ * the cost of being wrong that way is a post that goes up privately, and the
+ * cost of the opposite is one that fails after everything has uploaded.
+ */
+export function isTikTokContentPostingAudited(): boolean {
+  const raw = process.env.TIKTOK_CONTENT_POSTING_AUDITED?.trim().toLowerCase();
   return raw !== undefined && TRUTHY.includes(raw);
 }
 

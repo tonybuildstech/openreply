@@ -57,6 +57,8 @@ interface EditablePost {
     avatarUrl: string | null;
     status: string;
     tiktokPostMode: "INBOX" | "DIRECT_POST" | null;
+    /** TikTok's Content Posting audit — decides which privacy levels exist. */
+    tiktokAuditApproved?: boolean;
   };
   policy: {
     editable: EditableField[];
@@ -385,6 +387,9 @@ export default function EditScheduledPostPage() {
                 value={options}
                 photoCount={post.media.length}
                 tiktokPostMode={post.connectedAccount.tiktokPostMode}
+                tiktokAuditApproved={
+                  post.connectedAccount.tiktokAuditApproved
+                }
                 onChange={(patch) =>
                   setOptions((current) => ({ ...current, ...patch }))
                 }
